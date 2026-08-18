@@ -26,6 +26,9 @@ pub struct Config {
     pub request_deadline_secs: u64,
     /// Hard cap on an avatar response body, before decode.
     pub avatar_max_bytes: u64,
+    /// In-flight renders. Stampede protection coalesces the same pubkey; this
+    /// bounds a burst of distinct ones, each of which costs a fetch and a raster.
+    pub max_concurrent_renders: usize,
     /// Directory with the bundled fonts.
     pub assets_dir: String,
     /// Must match a family in `assets_dir`. Not inferred from load order.
@@ -69,6 +72,7 @@ impl Config {
             avatar_timeout_secs: parse("AVATAR_TIMEOUT_SECS", 2),
             request_deadline_secs: parse("REQUEST_DEADLINE_SECS", 4),
             avatar_max_bytes: parse("AVATAR_MAX_BYTES", 5 * 1024 * 1024),
+            max_concurrent_renders: parse("MAX_CONCURRENT_RENDERS", 32),
             assets_dir: var("ASSETS_DIR", "assets"),
             font_family: var("FONT_FAMILY", "Figtree"),
         }

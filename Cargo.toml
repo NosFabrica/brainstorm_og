@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "OpenGraph share-card service for Brainstorm profiles"
 
+[lib]
+name = "brainstorm_og"
+path = "src/lib.rs"
+
 [[bin]]
 name = "brainstorm-og"
 path = "src/main.rs"
@@ -11,7 +15,7 @@ path = "src/main.rs"
 [dependencies]
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
-tower = "0.5"
+tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["trace", "timeout", "catch-panic", "limit"] }
 bytes = "1"
 

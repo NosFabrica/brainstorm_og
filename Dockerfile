@@ -8,7 +8,10 @@ WORKDIR /app
 
 # Cache dependencies independently of source changes.
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo 'fn main() {}' > src/main.rs \
+# Both targets must exist or cargo refuses to read the manifest.
+RUN mkdir src \
+    && echo 'fn main() {}' > src/main.rs \
+    && touch src/lib.rs \
     && cargo build --release --locked \
     && rm -rf src
 
@@ -18,7 +21,7 @@ RUN mkdir src && echo 'fn main() {}' > src/main.rs \
 COPY assets ./assets
 COPY src ./src
 # Bust the stub's cached mtime so the real binary rebuilds.
-RUN touch src/main.rs && cargo build --release --locked
+RUN touch src/main.rs src/lib.rs && cargo build --release --locked
 
 # ---- runtime (scratch: static binary + assets + CA bundle) ----
 FROM scratch

@@ -114,6 +114,7 @@ container; the caches are in-memory, so restarting is what resets them.
 | `AVATAR_TIMEOUT_SECS` | `2` | avatar image fetch |
 | `AVATAR_MAX_BYTES` | `5242880` (5 MB) | body cap before decode |
 | `REQUEST_DEADLINE_SECS` | `4` | whole-request budget |
+| `MAX_CONCURRENT_RENDERS` | `32` | in-flight card renders; queues past this |
 | `ASSETS_DIR` | `assets` | bundled fonts |
 | `FONT_FAMILY` | `Figtree` | must match a family in `ASSETS_DIR` |
 
