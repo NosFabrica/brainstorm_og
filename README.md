@@ -5,9 +5,9 @@ Telegram, Facebook, …) fetches a profile URL, it gets per-profile `<meta>` tag
 and a generated card image — instead of the SPA's generic static card. Humans
 are never routed here; they keep getting the React app unchanged.
 
-It is **off by default**: if you don't deploy it and don't add the routing rule,
-nothing changes. The app has no hard dependency on it — the UI's nginx falls
-back to serving the SPA when this service is absent or down.
+The app has no hard dependency on it: the UI's nginx falls back to serving the
+SPA when this service is absent or down, so removing it degrades unfurls back to
+the SPA's generic card rather than breaking anything.
 
 ## Routes
 
@@ -21,11 +21,13 @@ back to serving the SPA when this service is absent or down.
 
 ## The card
 
-Mirrors the UI so the in-app preview and the actual unfurl are the same artefact:
-the dark surface from `YourNetworkCard`'s dark variant, the brand wordmark, the
-avatar, and the **Verification Coin** (`components/score/VerificationCoin.tsx`)
-pinned to the avatar's corner — deliberately label-less, fill carrying tier and
-the ring carrying point of view.
+Built from the UI's design tokens: the dark surface from `YourNetworkCard`'s
+dark variant, the brand wordmark, the avatar, and the **Verification Coin**
+(`components/score/VerificationCoin.tsx`) pinned to the avatar's corner —
+deliberately label-less, fill carrying tier and the ring carrying point of view.
+
+This is not a copy of the app's in-app share panel, which is a separate surface
+with a different audience and is free to look different.
 
 Always the **global (house)** perspective. There is no viewer to personalise
 for, so the coin never uses the personalized purple ring.
@@ -143,4 +145,4 @@ curl -s localhost:8080/og/$NPUB.png -o card.png
 The UI pod's own nginx sends crawler User-Agents on `/p/*` here, and all of
 `/og/*` for everyone. Deliberately not the ingress: staging and prod share a
 cluster, so a map in the shared controller config would carry prod blast radius.
-See [`deploy/README.md`](deploy/README.md) and the ADR in `brainstorm-k8s`.
+See [`deploy/README.md`](deploy/README.md); the reasoning is in [`CONTEXT.md`](CONTEXT.md).

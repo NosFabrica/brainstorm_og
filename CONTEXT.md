@@ -94,10 +94,19 @@ not restart the pod and drop every in-flight crawler with it.
 
 ### The crawler split lives in the UI pod's nginx
 
-Not the shared F5 ingress: staging and prod are the same cluster, so a map in
-the controller config carries prod blast radius, and `setup_ingress.sh` calls
-itself the single source of truth, so a map added elsewhere is deleted on its
-next run. See the ADR in `brainstorm-k8s`.
+Not the shared F5 ingress. Staging and prod are the same cluster
+(`deploy_targets.conf`), so a map in the controller config carries prod blast
+radius; `setup_ingress.sh` calls itself the single source of truth for that
+config, so a map added out-of-band is dropped on its next run; and the
+controller validates `Condition.variable` against built-in NGINX variables, so
+a custom `$is_og_bot` likely fails the CRD webhook anyway. The UI-nginx failure
+mode is reproducible with `docker run` and `curl` before anything ships.
+
+Consequence worth stating: `ogPreview.enabled` and a UI image carrying the
+nginx config are independent halves. Either alone is safe — an unrouted service
+idles, an unresolvable upstream falls back to the SPA — but both are needed for
+unfurls to work and **neither reports the other missing**, because "og is
+absent" and "og is misconfigured" are the same observable.
 
 ## Accepted risk
 
