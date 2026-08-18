@@ -1,110 +1,153 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Response},
 };
-use std::sync::Arc;
+use bytes::Bytes;
+use serde::Deserialize;
 
 use crate::data::{self, Card};
 use crate::nip19;
 use crate::render;
 use crate::state::AppState;
 
-pub async fn healthz() -> &'static str {
-    "ok"
+pub async fn healthz(State(st): State<AppState>) -> Response {
+    // Face count is here because a fontless image renders every card blank,
+    // and `scratch` gives you no shell to diagnose it with.
+    let body = serde_json::json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "font_family": st.config.font_family,
+        "faces": st.fontdb.len(),
+    });
+    (StatusCode::OK, axum::Json(body)).into_response()
 }
 
-/// Crawler-facing HTML: per-profile OG/Twitter meta tags. Humans are routed to the
-/// SPA by the ingress and never reach this; the body link is just a courtesy.
-pub async fn profile(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Response {
+/// Meta tags for crawlers. `/p/{id}` (canonical) and `/profile/{id}` (legacy).
+pub async fn profile(State(st): State<AppState>, Path(id): Path<String>) -> Response {
     let pointer = match nip19::decode(&id) {
         Ok(p) => p,
         Err(e) => {
             tracing::debug!("bad profile id {id}: {e}");
-            return StatusCode::NOT_FOUND.into_response();
+            return bad_id();
         }
     };
 
     let card = data::get_card(&st, &pointer).await;
-    let base = request_base_url(&st, &headers);
-    let html = build_meta_html(&base, &id, &card);
+    let html = build_meta_html(&st, &id, &card);
 
-    (cache_headers("text/html; charset=utf-8", &st), Html(html)).into_response()
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    // Short: this document exists to advertise the current `?v=`.
+    set_cache(
+        &mut headers,
+        &format!("public, max-age={}", st.config.html_cache_max_age),
+    );
+    (headers, Html(html)).into_response()
 }
 
-/// Build the public origin from the request itself so og:url / og:image always
-/// match the address the crawler used (prod domain, tunnel, or localhost). Falls
-/// back to APP_BASE_URL only when no Host is present.
-fn request_base_url(st: &AppState, headers: &HeaderMap) -> String {
-    let host = headers
-        .get("x-forwarded-host")
-        .or_else(|| headers.get(header::HOST))
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|h| !h.is_empty());
-
-    match host {
-        Some(h) => {
-            let scheme = if h.starts_with("localhost")
-                || h.starts_with("127.0.0.1")
-                || h.starts_with("[::1]")
-            {
-                "http"
-            } else {
-                "https"
-            };
-            format!("{scheme}://{h}")
-        }
-        None => st.config.app_base_url.clone(),
-    }
+/// `?v=` is the content hash. Never read; it exists so a changed card gets a
+/// different URL.
+#[derive(Deserialize)]
+pub struct ImageQuery {
+    #[allow(dead_code)]
+    v: Option<String>,
 }
 
-/// Generated PNG card. `/og/{id}.png`.
-pub async fn og_image(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+pub async fn og_image(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Query(_q): Query<ImageQuery>,
+) -> Response {
     let id = id.strip_suffix(".png").unwrap_or(&id).to_string();
     let pointer = match nip19::decode(&id) {
         Ok(p) => p,
-        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        Err(_) => return bad_id(),
     };
 
-    let png = if let Some(cached) = st.png_cache.get(&pointer.hex).await {
-        cached
-    } else {
-        let card = data::get_card(&st, &pointer).await;
-        let bytes = match render::render_card(&st, &card).await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!("render failed for {}: {e}", pointer.hex);
-                render::render_fallback(&st)
+    if let Some(cached) = st.png_cache.get(&pointer.hex).await {
+        return image_response(&st, cached);
+    }
+
+    let card = data::get_card(&st, &pointer).await;
+    match render::render_card(&st, &card).await {
+        Ok(bytes) => {
+            let bytes = Bytes::from(bytes);
+            st.png_cache
+                .insert(pointer.hex.clone(), bytes.clone())
+                .await;
+            image_response(&st, bytes)
+        }
+        Err(e) => {
+            tracing::warn!("render failed for {}: {e}", pointer.hex);
+            // Not cached: a transient failure must not outlive itself.
+            match render::render_fallback(&st).await {
+                Some(bytes) => {
+                    let mut headers = png_headers();
+                    set_cache(&mut headers, "no-store");
+                    (headers, Bytes::from(bytes)).into_response()
+                }
+                None => {
+                    let mut headers = HeaderMap::new();
+                    set_cache(&mut headers, "no-store");
+                    (StatusCode::SERVICE_UNAVAILABLE, headers).into_response()
+                }
             }
-        };
-        let arc = Arc::new(bytes);
-        st.png_cache.insert(pointer.hex.clone(), arc.clone()).await;
-        arc
-    };
-
-    (cache_headers("image/png", &st), png.to_vec()).into_response()
+        }
+    }
 }
 
-fn cache_headers(content_type: &'static str, st: &AppState) -> HeaderMap {
+/// A malformed id never becomes valid, so caches may absorb the retry.
+fn bad_id() -> Response {
     let mut headers = HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
-    let cc = format!("public, max-age={}", st.config.http_cache_max_age);
-    if let Ok(v) = HeaderValue::from_str(&cc) {
-        headers.insert(header::CACHE_CONTROL, v);
-    }
+    set_cache(&mut headers, "public, max-age=3600");
+    (StatusCode::BAD_REQUEST, headers).into_response()
+}
+
+fn png_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
     headers
 }
 
-fn build_meta_html(app: &str, id: &str, card: &Card) -> String {
-    let title = esc(&card.meta.best_name().unwrap_or_else(|| "Nostr profile on Brainstorm".to_string()));
+fn image_response(st: &AppState, bytes: Bytes) -> Response {
+    let mut headers = png_headers();
+    // Immutable: the URL carries a content hash, so this mapping never changes.
+    set_cache(
+        &mut headers,
+        &format!(
+            "public, max-age={}, immutable",
+            st.config.image_cache_max_age
+        ),
+    );
+    (headers, bytes).into_response()
+}
+
+fn set_cache(headers: &mut HeaderMap, value: &str) {
+    if let Ok(v) = HeaderValue::from_str(value) {
+        headers.insert(header::CACHE_CONTROL, v);
+    }
+}
+
+fn build_meta_html(st: &AppState, id: &str, card: &Card) -> String {
+    let app = &st.config.app_base_url;
+    let title = esc(&format!("{} on Brainstorm", card.display_name()));
     let desc = esc(&meta_description(card));
-    let page_url = esc(&format!("{app}/profile/{id}"));
-    let image_url = esc(&format!("{app}/og/{id}.png"));
+
+    // From config, never the request Host. See CONTEXT.md.
+    let page_url = esc(&format!("{app}/p/{id}"));
+    let image_url = esc(&format!("{app}/og/{id}.png?v={}", card.version()));
+    // Mirrors VerificationCoin's aria-label; always the house perspective.
+    let image_alt = esc(&match card.rank() {
+        Some(r) => format!(
+            "{} — verification score {r} out of 100, global view",
+            card.display_name()
+        ),
+        None => format!("{} — unrated, global view", card.display_name()),
+    });
 
     format!(
         r#"<!doctype html>
@@ -121,12 +164,15 @@ fn build_meta_html(app: &str, id: &str, card: &Card) -> String {
 <meta property="og:description" content="{desc}"/>
 <meta property="og:url" content="{page_url}"/>
 <meta property="og:image" content="{image_url}"/>
+<meta property="og:image:type" content="image/png"/>
 <meta property="og:image:width" content="1200"/>
 <meta property="og:image:height" content="630"/>
+<meta property="og:image:alt" content="{image_alt}"/>
 <meta name="twitter:card" content="summary_large_image"/>
 <meta name="twitter:title" content="{title}"/>
 <meta name="twitter:description" content="{desc}"/>
 <meta name="twitter:image" content="{image_url}"/>
+<meta name="twitter:image:alt" content="{image_alt}"/>
 </head>
 <body>
 <p>Viewing <a href="{page_url}">{title}</a> on Brainstorm — the Web of Trust layer for Nostr.</p>
@@ -144,14 +190,14 @@ fn meta_description(card: &Card) -> String {
     }
     match &card.overview {
         Some(o) => {
-            let inf = o
-                .influence
-                .map(|v| {
-                    let scaled = if v <= 1.0 { v * 100.0 } else { v };
-                    format!("Influence {:.0} · ", scaled.round())
-                })
+            let rank = card
+                .rank()
+                .map(|r| format!("Verification score {r} · "))
                 .unwrap_or_default();
-            format!("{inf}{} followers · {} following on Brainstorm.", o.followers, o.following)
+            format!(
+                "{rank}{} followers · {} following on Brainstorm.",
+                o.followers, o.following
+            )
         }
         None => "A Nostr profile on Brainstorm — the Web of Trust layer for Nostr.".to_string(),
     }
@@ -168,10 +214,83 @@ fn clip(s: &str, max: usize) -> String {
     }
 }
 
+/// HTML escaping. `&#39;` here vs `&apos;` in `render::esc` — `&apos;` is not
+/// an HTML4 entity. Do not unify them.
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::{Overview, ProfileMeta};
+
+    fn card_with(about: Option<&str>, influence: Option<f64>) -> Card {
+        Card {
+            hex: "a".repeat(64),
+            meta: ProfileMeta {
+                display_name: Some("Alice".into()),
+                about: about.map(str::to_string),
+                ..Default::default()
+            },
+            overview: Some(Overview {
+                influence,
+                followers: 12,
+                following: 34,
+                tier: Some("high".into()),
+            }),
+            provisional: false,
+        }
+    }
+
+    #[test]
+    fn esc_covers_the_html_five() {
+        assert_eq!(esc(r#"<&>"'"#), "&lt;&amp;&gt;&quot;&#39;");
+        // Ampersand must be escaped first or the others double-escape.
+        assert_eq!(esc("&lt;"), "&amp;lt;");
+    }
+
+    #[test]
+    fn clip_counts_chars_not_bytes() {
+        assert_eq!(clip("abc", 10), "abc");
+        assert_eq!(clip("abcdef", 4), "abc…");
+        assert_eq!(clip("さとうさとう", 3), "さと…");
+    }
+
+    #[test]
+    fn description_prefers_about_then_stats() {
+        assert_eq!(
+            meta_description(&card_with(Some("  hello   world "), Some(0.4))),
+            "hello world"
+        );
+        // Whitespace-only `about` must fall through, not render blank.
+        let s = meta_description(&card_with(Some("   "), Some(0.4)));
+        assert!(s.contains("Verification score 40"), "got {s}");
+        assert!(s.contains("12 followers"));
+
+        // No score at all: no dangling prefix.
+        let s = meta_description(&card_with(None, None));
+        assert!(!s.contains("Verification score"), "got {s}");
+    }
+
+    #[test]
+    fn image_url_carries_the_content_hash() {
+        let st_cfg = crate::config::Config::from_env();
+        let card = card_with(None, Some(0.42));
+        // Build the URL the same way the template does.
+        let url = format!(
+            "{}/og/{}.png?v={}",
+            st_cfg.app_base_url,
+            "npubxyz",
+            card.version()
+        );
+        assert!(url.contains("?v="));
+        // And it must move when the rendered content moves.
+        let other = card_with(None, Some(0.55));
+        assert_ne!(card.version(), other.version());
+    }
 }

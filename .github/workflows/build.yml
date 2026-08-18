@@ -17,8 +17,27 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  test:
+    name: Lint and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --locked --all-features
+      # The image decoder and TLS stacks here are fed attacker-controlled bytes,
+      # so advisories matter more than usual.
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   build:
     name: Build and push image
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read

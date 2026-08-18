@@ -1,19 +1,57 @@
+//! The share card: 1200x630 PNG, SVG -> raster via resvg. Mirrors the UI's
+//! dark card surface and `VerificationCoin`. See CONTEXT.md.
+
 use anyhow::{anyhow, Result};
 use base64::Engine as _;
 use resvg::{tiny_skia, usvg};
+use std::io::Cursor;
 use std::time::Duration;
 
-use crate::data::{Card, Overview};
+use crate::data::Card;
 use crate::state::AppState;
+use crate::tier::Tier;
 
 pub const WIDTH: u32 = 1200;
 pub const HEIGHT: u32 = 630;
 
-const BG: &str = "#0f0d2e";
-const ACCENT: &str = "#7c6cff";
-const FG: &str = "#ffffff";
-const MUTED: &str = "#8b8fae";
-const SOFT: &str = "#c7cae0";
+// Brand tokens. Note the slate ramp is REDEFINED in `tailwind.config.ts:115` —
+// slate-900 is #151c2a here, not Tailwind's stock #0f172a. Taking the stock
+// values would put the card a few shades off every other dark surface.
+const SURFACE: &str = "#151c2a"; // slate-900 — the dark card base
+const ACCENT: &str = "#13d2e5"; // Aurora Cyan
+const PRIMARY: &str = "#7237ff"; // Aurora Purple
+const INK: &str = "#f2f3f0"; // slate-50 — primary text on dark
+const LINK: &str = "#a78bfa"; // --brand-link dark override, index.css:147
+const MUTED: &str = "#9aa1ac"; // slate-400
+const TRACK: &str = "#6b7480"; // slate-600 — unrated coin's dashed outline
+
+// Avatar, and the coin pinned to its bottom-right corner — the same
+// composition as the /p hero (`SharePage.tsx:925`, coin at `-bottom-1 -right-1`).
+const AV_X: f32 = 72.0;
+const AV_Y: f32 = 176.0;
+const AV_SIZE: f32 = 300.0;
+const AV_RADIUS: f32 = 56.0;
+
+const COIN_R: f32 = 62.0;
+const COIN_CX: f32 = AV_X + AV_SIZE - 34.0;
+const COIN_CY: f32 = AV_Y + AV_SIZE - 34.0;
+/// The two-step point-of-view ring: a surface-coloured separator, then the POV
+/// hue. The separator exists because a purple ring would be invisible on a
+/// `high` coin, whose fill is the same Aurora Purple.
+const COIN_RING_STEP: f32 = 6.0;
+/// slate-600, the dark-mode global ring from `POV_RING` in VerificationCoin.
+/// This card is always the house/global view — there is no viewer to
+/// personalise for — so it never uses the personalized purple.
+const POV_GLOBAL: &str = "#6b7480";
+
+const TEXT_X: f32 = 424.0;
+
+/// Compiled in, not read from `ASSETS_DIR`, so a bad path cannot strip the
+/// card's branding. Its own fill is slate-50, matching `INK`.
+const WORDMARK: &str = include_str!("../assets/wordmark-white.svg");
+const WORDMARK_W: f32 = 208.0;
+/// Preserves the asset's 100:23 aspect.
+const WORDMARK_H: f32 = WORDMARK_W * 0.23;
 
 /// Render a profile card to PNG. Missing avatar / metadata degrade gracefully.
 pub async fn render_card(state: &AppState, card: &Card) -> Result<Vec<u8>> {
@@ -22,143 +60,258 @@ pub async fn render_card(state: &AppState, card: &Card) -> Result<Vec<u8>> {
         None => None,
     };
     let svg = build_svg(state, card, avatar.as_deref());
-    rasterize(state, &svg)
+    rasterize(state, svg).await
 }
 
-/// Last-resort branded card when even normal rendering fails.
-pub fn render_fallback(state: &AppState) -> Vec<u8> {
+/// Last-resort branded card. `None` rather than an empty `Vec`, which would be
+/// served as a zero-byte `image/png`.
+pub async fn render_fallback(state: &AppState) -> Option<Vec<u8>> {
     let card = Card {
+        hex: String::new(),
         meta: Default::default(),
         overview: None,
+        provisional: true,
     };
     let svg = build_svg(state, &card, None);
-    rasterize(state, &svg).unwrap_or_default()
+    rasterize(state, svg).await.ok()
 }
 
+/// Fetch and normalise a kind-0 `picture`. The URL is attacker-controlled:
+/// `net` validates the address, the size cap and dimension check are here.
 async fn fetch_avatar(state: &AppState, url: &str) -> Result<Vec<u8>> {
+    let max = state.config.avatar_max_bytes;
+    let url = crate::net::validate_and_resolve(url, &["http", "https"]).await?;
+
     let resp = state
-        .http
+        .avatar_http
         .get(url)
         .timeout(Duration::from_secs(state.config.avatar_timeout_secs))
         .send()
         .await?
         .error_for_status()?;
-    let bytes = resp.bytes().await?;
-    // Re-encode to PNG (handles webp/jpeg/gif) and cover-crop to a square so usvg
-    // can always embed it and the circle clip looks right.
-    let img = image::load_from_memory(&bytes)?
+
+    // Cheap rejection when the server is honest about the size...
+    if let Some(len) = resp.content_length() {
+        if len > max {
+            return Err(anyhow!("avatar is {len} bytes, over the {max} cap"));
+        }
+    }
+
+    // ...and a hard stop when it isn't. `bytes()` would buffer the whole body
+    // regardless of what Content-Length claimed.
+    let mut body: Vec<u8> = Vec::new();
+    let mut stream = resp.bytes_stream();
+    use futures_util::StreamExt as _;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if body.len() as u64 + chunk.len() as u64 > max {
+            return Err(anyhow!("avatar body exceeded the {max} byte cap"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    let reader = image::ImageReader::new(Cursor::new(&body)).with_guessed_format()?;
+    let format = reader
+        .format()
+        .ok_or_else(|| anyhow!("unknown image format"))?;
+    if !matches!(
+        format,
+        image::ImageFormat::Png
+            | image::ImageFormat::Jpeg
+            | image::ImageFormat::WebP
+            | image::ImageFormat::Gif
+    ) {
+        return Err(anyhow!("unsupported avatar format {format:?}"));
+    }
+
+    // Check the declared dimensions BEFORE decoding. `resize_to_fill` shrinks
+    // to 240x240, but only after a full decode — a 30000x30000 PNG would
+    // allocate gigabytes first.
+    let (w, h) = reader.into_dimensions()?;
+    if w > 8192 || h > 8192 {
+        return Err(anyhow!("avatar is {w}x{h}, over the 8192 limit"));
+    }
+
+    let mut reader = image::ImageReader::new(Cursor::new(&body)).with_guessed_format()?;
+    reader.limits({
+        let mut l = image::Limits::default();
+        l.max_image_width = Some(8192);
+        l.max_image_height = Some(8192);
+        l.max_alloc = Some(128 * 1024 * 1024);
+        l
+    });
+    let img = reader
+        .decode()?
         .resize_to_fill(240, 240, image::imageops::FilterType::Lanczos3);
-    let mut out = std::io::Cursor::new(Vec::new());
+
+    let mut out = Cursor::new(Vec::new());
     img.write_to(&mut out, image::ImageFormat::Png)?;
     Ok(out.into_inner())
 }
 
-fn rasterize(state: &AppState, svg: &str) -> Result<Vec<u8>> {
-    let opt = usvg::Options {
-        font_family: state.font_family.clone(),
-        fontdb: state.fontdb.clone(),
-        ..Default::default()
-    };
+/// Off the reactor: pure CPU that would otherwise block a runtime worker.
+async fn rasterize(state: &AppState, svg: String) -> Result<Vec<u8>> {
+    let fontdb = state.fontdb.clone();
+    let family = state.config.font_family.clone();
 
-    let tree = usvg::Tree::from_str(svg, &opt)?;
-    let mut pixmap = tiny_skia::Pixmap::new(WIDTH, HEIGHT).ok_or_else(|| anyhow!("pixmap alloc failed"))?;
-    resvg::render(&tree, tiny_skia::Transform::identity(), &mut pixmap.as_mut());
-    Ok(pixmap.encode_png()?)
+    tokio::task::spawn_blocking(move || {
+        let opt = usvg::Options {
+            font_family: family,
+            fontdb,
+            ..Default::default()
+        };
+        let tree = usvg::Tree::from_str(&svg, &opt)?;
+        let mut pixmap =
+            tiny_skia::Pixmap::new(WIDTH, HEIGHT).ok_or_else(|| anyhow!("pixmap alloc failed"))?;
+        resvg::render(
+            &tree,
+            tiny_skia::Transform::identity(),
+            &mut pixmap.as_mut(),
+        );
+        Ok(pixmap.encode_png()?)
+    })
+    .await?
 }
 
 fn build_svg(state: &AppState, card: &Card, avatar_png: Option<&[u8]>) -> String {
-    let family = &state.font_family;
-    let name = card.meta.best_name().unwrap_or_else(|| "Nostr profile".to_string());
-    let name = esc(&truncate(&name, 22));
-    let nip05 = card.meta.nip05.as_deref().map(|s| esc(&truncate(s, 38)));
-    let about = card
+    let family = esc(&state.config.font_family);
+    let name = esc(&truncate(&sanitize(&card.display_name()), 24));
+    let nip05 = card
         .meta
-        .about
+        .nip05
         .as_deref()
-        .map(|s| esc(&truncate(&one_line(s), 64)));
+        .map(|s| esc(&truncate(&sanitize(s.trim_start_matches("_@")), 34)));
 
-    let influence = fmt_influence(&card.overview);
-    let followers = humanize(card.overview.as_ref().map(|o| o.followers).unwrap_or(0));
-    let following = humanize(card.overview.as_ref().map(|o| o.following).unwrap_or(0));
-
-    let avatar_svg = match avatar_png {
-        Some(png) => {
-            let b64 = base64::engine::general_purpose::STANDARD.encode(png);
-            format!(
-                r#"<clipPath id="av"><circle cx="150" cy="200" r="110"/></clipPath>
-<image x="40" y="90" width="220" height="220" href="data:image/png;base64,{b64}" clip-path="url(#av)" preserveAspectRatio="xMidYMid slice"/>
-<circle cx="150" cy="200" r="110" fill="none" stroke="{ACCENT}" stroke-width="4"/>"#
-            )
-        }
-        None => {
-            let initial = esc(&first_initial(&name));
-            format!(
-                r##"<circle cx="150" cy="200" r="110" fill="#1b1840" stroke="{ACCENT}" stroke-width="4"/>
-<text x="150" y="200" font-family="{family}" font-size="110" font-weight="700" fill="{ACCENT}" text-anchor="middle" dominant-baseline="central">{initial}</text>"##
-            )
-        }
-    };
-
+    let tier = card.tier();
+    let avatar_svg = avatar_block(&family, avatar_png, &name);
     let nip05_svg = nip05
-        .map(|s| format!(r#"<text x="300" y="218" font-family="{family}" font-size="28" fill="{ACCENT}">{s}</text>"#))
-        .unwrap_or_default();
-
-    let about_svg = about
-        .map(|s| format!(r#"<text x="300" y="278" font-family="{family}" font-size="30" fill="{SOFT}">{s}</text>"#))
+        .map(|s| {
+            format!(
+                r#"<text x="{TEXT_X}" y="376" font-family="{family}" font-size="36" fill="{LINK}">{s}</text>"#
+            )
+        })
         .unwrap_or_default();
 
     format!(
         r##"<svg xmlns="http://www.w3.org/2000/svg" width="{WIDTH}" height="{HEIGHT}" viewBox="0 0 {WIDTH} {HEIGHT}">
-<rect width="{WIDTH}" height="{HEIGHT}" fill="{BG}"/>
-<rect width="{WIDTH}" height="8" fill="{ACCENT}"/>
+<defs>
+  <!-- The card surface, from YourNetworkCard.tsx:77's dark variant:
+       `dark:from-slate-900 dark:via-slate-900 dark:to-brand-primary/[0.12]`.
+       Flat for the first 55% so the tint stays a corner, exactly as `via-`
+       holds the base colour through the middle stop. -->
+  <linearGradient id="wash" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0%" stop-color="{SURFACE}"/>
+    <stop offset="55%" stop-color="{SURFACE}"/>
+    <stop offset="100%" stop-color="{PRIMARY}" stop-opacity="0.12"/>
+  </linearGradient>
+</defs>
+<rect width="{WIDTH}" height="{HEIGHT}" fill="{SURFACE}"/>
+<rect width="{WIDTH}" height="{HEIGHT}" fill="url(#wash)"/>
+{wordmark}
 {avatar_svg}
-<text x="300" y="170" font-family="{family}" font-size="60" font-weight="700" fill="{FG}">{name}</text>
+{coin}
+<text x="{TEXT_X}" y="312" font-family="{family}" font-size="72" font-weight="700" fill="{INK}">{name}</text>
 {nip05_svg}
-{about_svg}
-<rect x="40" y="380" width="1120" height="170" rx="20" fill="#16133a"/>
-{stat_0}
-{stat_1}
-{stat_2}
-<text x="1160" y="600" font-family="{family}" font-size="32" font-weight="700" fill="{ACCENT}" text-anchor="end">brainstorm</text>
+<text x="72" y="574" font-family="{family}" font-size="30" fill="{MUTED}">{tagline}</text>
 </svg>"##,
-        stat_0 = stat_block(family, 110, &influence, "Influence"),
-        stat_1 = stat_block(family, 470, &followers, "Followers"),
-        stat_2 = stat_block(family, 830, &following, "Following"),
+        wordmark = wordmark_svg(72.0, 72.0),
+        coin = coin_block(&family, card.rank(), tier),
+        tagline = esc(tagline_for(card)),
     )
 }
 
-fn stat_block(family: &str, x: u32, value: &str, label: &str) -> String {
-    format!(
-        r#"<text x="{x}" y="475" font-family="{family}" font-size="64" font-weight="700" fill="{FG}">{value}</text>
-<text x="{x}" y="520" font-family="{family}" font-size="28" fill="{MUTED}">{label}</text>"#,
-        value = esc(value),
-        label = esc(label),
-    )
+/// The tagline slot.
+///
+/// Deliberately a single seam: the copy decision (one line vs. a list keyed by
+/// pubkey vs. per-tier wording) is still open, and whatever it lands on, the
+/// result must be STABLE for a given card — an unstable tagline would desync
+/// from the `?v=` content hash and make the image URL lie.
+fn tagline_for(_card: &Card) -> &'static str {
+    "Reputation from real human connections."
 }
 
-fn fmt_influence(overview: &Option<Overview>) -> String {
-    match overview.as_ref().and_then(|o| o.influence) {
-        // Influence is a 0..1 trust score; show as a 0..100 figure.
-        Some(v) => {
-            let scaled = if v <= 1.0 { v * 100.0 } else { v };
-            format!("{:.0}", scaled.round())
+/// Nested `<svg>` rather than splicing the path out, so the asset keeps its own
+/// viewBox and survives being re-exported.
+fn wordmark_svg(x: f32, y: f32) -> String {
+    let inner = WORDMARK
+        .trim()
+        .replacen(
+            r#"width="100" height="23""#,
+            &format!(r#"width="{WORDMARK_W}" height="{WORDMARK_H}""#),
+            1,
+        )
+        .replacen("<svg ", &format!(r#"<svg x="{x}" y="{y}" "#), 1);
+    inner
+}
+
+fn avatar_block(family: &str, avatar_png: Option<&[u8]>, name: &str) -> String {
+    match avatar_png {
+        Some(png) => {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(png);
+            format!(
+                r##"<clipPath id="av"><rect x="{AV_X}" y="{AV_Y}" width="{AV_SIZE}" height="{AV_SIZE}" rx="{AV_RADIUS}"/></clipPath>
+<image x="{AV_X}" y="{AV_Y}" width="{AV_SIZE}" height="{AV_SIZE}" href="data:image/png;base64,{b64}" clip-path="url(#av)" preserveAspectRatio="xMidYMid slice"/>
+<rect x="{AV_X}" y="{AV_Y}" width="{AV_SIZE}" height="{AV_SIZE}" rx="{AV_RADIUS}" fill="none" stroke="{ACCENT}" stroke-opacity="0.25" stroke-width="3"/>"##
+            )
         }
-        None => "—".to_string(),
+        None => {
+            let initial = esc(&first_initial(name));
+            format!(
+                r##"<rect x="{AV_X}" y="{AV_Y}" width="{AV_SIZE}" height="{AV_SIZE}" rx="{AV_RADIUS}" fill="{PRIMARY}" fill-opacity="0.18"/>
+<text x="{cx}" y="{cy}" font-family="{family}" font-size="128" font-weight="700" fill="{LINK}" text-anchor="middle" dominant-baseline="central">{initial}</text>"##,
+                cx = AV_X + AV_SIZE / 2.0,
+                cy = AV_Y + AV_SIZE / 2.0,
+            )
+        }
     }
 }
 
-fn humanize(n: i64) -> String {
-    if n.abs() >= 1000 {
-        let k = n as f64 / 1000.0;
-        let s = format!("{:.1}", k);
-        format!("{}k", s.trim_end_matches(".0"))
-    } else {
-        n.to_string()
-    }
+/// The Verification Coin. Fill carries tier, ring carries point of view.
+/// Label-less by design — see CONTEXT.md.
+fn coin_block(family: &str, rank: Option<i64>, tier: Tier) -> String {
+    let text = tier.text_color();
+    let value = esc(&rank
+        .map(|r| r.to_string())
+        .unwrap_or_else(|| "—".to_string()));
+
+    let body = match tier.fill() {
+        Some(fill) => format!(
+            r#"<circle cx="{COIN_CX}" cy="{COIN_CY}" r="{COIN_R}" fill="{fill}"/>
+<circle cx="{COIN_CX}" cy="{COIN_CY}" r="{sep_r}" fill="none" stroke="{SURFACE}" stroke-width="{COIN_RING_STEP}"/>
+<circle cx="{COIN_CX}" cy="{COIN_CY}" r="{pov_r}" fill="none" stroke="{POV_GLOBAL}" stroke-width="{COIN_RING_STEP}"/>"#,
+            sep_r = COIN_R + COIN_RING_STEP / 2.0,
+            pov_r = COIN_R + COIN_RING_STEP * 1.5,
+        ),
+        // No score is an OUTLINE, not another grey fill — absence of a number
+        // is a difference in kind, and the POV ring is suppressed with it.
+        None => format!(
+            r#"<circle cx="{COIN_CX}" cy="{COIN_CY}" r="{COIN_R}" fill="{SURFACE}" stroke="{TRACK}" stroke-width="4" stroke-dasharray="12 10"/>"#
+        ),
+    };
+
+    format!(
+        r#"{body}
+<text x="{COIN_CX}" y="{COIN_CY}" font-family="{family}" font-size="{size}" font-weight="700" fill="{text}" text-anchor="middle" dominant-baseline="central">{value}</text>"#,
+        // 0.4 of the diameter, matching the coin's own `fontSize` rule.
+        size = (COIN_R * 2.0 * 0.4).round(),
+    )
 }
 
-fn one_line(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+/// Drop control characters and bidi overrides — an RTL override in a display
+/// name can visually reorder the rest of the card.
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(
+                    *c,
+                    '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}'
+                )
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
@@ -173,13 +326,53 @@ fn truncate(s: &str, max_chars: usize) -> String {
 }
 
 fn first_initial(name: &str) -> String {
-    name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "?".to_string())
+    name.chars()
+        .next()
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "?".to_string())
 }
 
+/// XML escaping. `&apos;` here vs `&#39;` in `routes::esc` — SVG is XML, that
+/// is HTML. Do not unify them.
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_counts_chars_not_bytes() {
+        assert_eq!(truncate("abc", 10), "abc");
+        assert_eq!(truncate("abcdef", 4), "abc…");
+        // Multi-byte must not split mid-codepoint.
+        assert_eq!(truncate("さとうさとう", 3), "さと…");
+        assert_eq!(truncate("🌻🌻🌻🌻", 3), "🌻🌻…");
+    }
+
+    #[test]
+    fn sanitize_strips_controls_and_bidi() {
+        assert_eq!(sanitize("a\u{202E}b"), "ab");
+        assert_eq!(sanitize("a\u{0000}b"), "ab");
+        assert_eq!(sanitize("  a   b  "), "a b");
+        // Ordinary text, including emoji and CJK, is untouched.
+        assert_eq!(sanitize("Alice 🌻 佐藤"), "Alice 🌻 佐藤");
+    }
+
+    #[test]
+    fn esc_covers_the_xml_five() {
+        assert_eq!(esc(r#"<&>"'"#), "&lt;&amp;&gt;&quot;&apos;");
+    }
+
+    #[test]
+    fn first_initial_handles_empty_and_unicode() {
+        assert_eq!(first_initial("alice"), "A");
+        assert_eq!(first_initial(""), "?");
+        assert_eq!(first_initial("さとう"), "さ");
+    }
 }
