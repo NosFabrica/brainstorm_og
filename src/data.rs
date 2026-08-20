@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use crate::nip19::Pointer;
 use crate::state::AppState;
-use crate::tier::Tier;
 
 /// Kind-0 profile metadata, from the in-cluster relay. See CONTEXT.md.
 #[derive(Clone, Default, Debug)]
@@ -92,10 +91,6 @@ pub struct Card {
 }
 
 impl Card {
-    pub fn tier(&self) -> Tier {
-        Tier::from_card(self)
-    }
-
     /// Falls back to a truncated npub, matching `SharePage.tsx:413`.
     pub fn display_name(&self) -> String {
         self.meta.best_name().unwrap_or_else(|| {
@@ -106,16 +101,21 @@ impl Card {
     }
 
     /// Content fingerprint for the `?v=` on `og:image` — what makes a changed
-    /// avatar or rank reach a crawler. Covers exactly what the card renders;
-    /// `about` is excluded because it only feeds the meta description.
-    pub fn version(&self) -> String {
+    /// name or avatar reach a crawler.
+    ///
+    /// Covers exactly what the card renders and nothing else. Score and
+    /// relationship counts are excluded: they move constantly, and hashing
+    /// them would mint a new image URL for an image identical to the last one.
+    /// `about` is out for the same reason — it only feeds the meta
+    /// description, which is served with a short max-age anyway.
+    pub fn version(&self, render_epoch: &str) -> String {
         let mut h = DefaultHasher::new();
         self.display_name().hash(&mut h);
         self.meta.picture.hash(&mut h);
         self.meta.nip05.hash(&mut h);
-        // f64 isn't Hash; the rendered integer is what the card actually shows.
-        self.rank().hash(&mut h);
-        self.tier().key().hash(&mut h);
+        // Inputs alone cannot express "the renderer changed", so a redraw would
+        // otherwise never reach anything holding an immutable URL.
+        render_epoch.hash(&mut h);
         format!("{:x}", h.finish())
     }
 
@@ -228,6 +228,8 @@ async fn fetch_meta(state: &AppState, hex: &str) -> Option<ProfileMeta> {
 mod tests {
     use super::*;
 
+    const EPOCH: &str = "test-epoch";
+
     fn card(name: Option<&str>, influence: Option<f64>) -> Card {
         Card {
             hex: "a".repeat(64),
@@ -300,14 +302,42 @@ mod tests {
     #[test]
     fn version_tracks_rendered_content() {
         let a = card(Some("Alice"), Some(0.42));
-        assert_eq!(a.version(), card(Some("Alice"), Some(0.42)).version());
-        // A changed name or rank must produce a new image URL...
-        assert_ne!(a.version(), card(Some("Alice B"), Some(0.42)).version());
-        assert_ne!(a.version(), card(Some("Alice"), Some(0.55)).version());
+        assert_eq!(
+            a.version(EPOCH),
+            card(Some("Alice"), Some(0.42)).version(EPOCH)
+        );
 
-        // ...but `about` only feeds the short-lived meta description.
+        // A changed name must mint a new image URL — it is drawn.
+        assert_ne!(
+            a.version(EPOCH),
+            card(Some("Alice B"), Some(0.42)).version(EPOCH)
+        );
+
+        // A changed score must NOT: the card no longer draws one, so a new URL
+        // would only force a re-fetch of a byte-identical image. Scores move
+        // constantly, so this is the difference between a stable URL and one
+        // that churns on every GrapeRank run.
+        assert_eq!(
+            a.version(EPOCH),
+            card(Some("Alice"), Some(0.55)).version(EPOCH)
+        );
+        assert_eq!(a.version(EPOCH), card(Some("Alice"), None).version(EPOCH));
+
+        // `about` only feeds the short-lived meta description.
         let mut b = card(Some("Alice"), Some(0.42));
         b.meta.about = Some("changed".into());
-        assert_eq!(a.version(), b.version());
+        assert_eq!(a.version(EPOCH), b.version(EPOCH));
+
+        // A new render epoch must move every hash, so a redraw reaches
+        // anything holding an immutable URL.
+        assert_ne!(a.version(EPOCH), a.version("other-epoch"));
+
+        // ...but the avatar and nip05 are drawn.
+        let mut c = card(Some("Alice"), Some(0.42));
+        c.meta.picture = Some("https://example/new.png".into());
+        assert_ne!(a.version(EPOCH), c.version(EPOCH));
+        let mut d = card(Some("Alice"), Some(0.42));
+        d.meta.nip05 = Some("alice@example.com".into());
+        assert_ne!(a.version(EPOCH), d.version(EPOCH));
     }
 }

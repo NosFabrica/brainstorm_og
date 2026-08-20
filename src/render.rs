@@ -1,5 +1,5 @@
-//! The share card: 1200x630 PNG, SVG -> raster via resvg. Mirrors the UI's
-//! dark card surface and `VerificationCoin`. See CONTEXT.md.
+//! The share card: 1200x630 PNG, SVG -> raster via resvg. Identity only —
+//! wordmark, avatar, name, nip05. See CONTEXT.md.
 
 use anyhow::{anyhow, Result};
 use base64::Engine as _;
@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use crate::data::Card;
 use crate::state::AppState;
-use crate::tier::Tier;
 
 pub const WIDTH: u32 = 1200;
 pub const HEIGHT: u32 = 630;
@@ -23,26 +22,12 @@ const PRIMARY: &str = "#7237ff"; // Aurora Purple
 const INK: &str = "#f2f3f0"; // slate-50 — primary text on dark
 const LINK: &str = "#a78bfa"; // --brand-link dark override, index.css:147
 const MUTED: &str = "#9aa1ac"; // slate-400
-const TRACK: &str = "#6b7480"; // slate-600 — unrated coin's dashed outline
 
-// Avatar, and the coin pinned to its bottom-right corner — the same
-// composition as the /p hero (`SharePage.tsx:925`, coin at `-bottom-1 -right-1`).
+// Avatar block, left of the identity text.
 const AV_X: f32 = 72.0;
 const AV_Y: f32 = 176.0;
 const AV_SIZE: f32 = 300.0;
 const AV_RADIUS: f32 = 56.0;
-
-const COIN_R: f32 = 62.0;
-const COIN_CX: f32 = AV_X + AV_SIZE - 34.0;
-const COIN_CY: f32 = AV_Y + AV_SIZE - 34.0;
-/// The two-step point-of-view ring: a surface-coloured separator, then the POV
-/// hue. The separator exists because a purple ring would be invisible on a
-/// `high` coin, whose fill is the same Aurora Purple.
-const COIN_RING_STEP: f32 = 6.0;
-/// slate-600, the dark-mode global ring from `POV_RING` in VerificationCoin.
-/// This card is always the house/global view — there is no viewer to
-/// personalise for — so it never uses the personalized purple.
-const POV_GLOBAL: &str = "#6b7480";
 
 const TEXT_X: f32 = 424.0;
 
@@ -216,7 +201,6 @@ fn build_svg(state: &AppState, card: &Card, avatar_png: Option<&[u8]>) -> String
         .as_deref()
         .map(|s| esc(&truncate(&sanitize(s.trim_start_matches("_@")), 34)));
 
-    let tier = card.tier();
     let avatar_svg = avatar_block(&family, avatar_png, &name);
     let nip05_svg = nip05
         .map(|s| {
@@ -243,13 +227,11 @@ fn build_svg(state: &AppState, card: &Card, avatar_png: Option<&[u8]>) -> String
 <rect width="{WIDTH}" height="{HEIGHT}" fill="url(#wash)"/>
 {wordmark}
 {avatar_svg}
-{coin}
 <text x="{TEXT_X}" y="312" font-family="{family}" font-size="72" font-weight="700" fill="{INK}">{name}</text>
 {nip05_svg}
 <text x="72" y="574" font-family="{family}" font-size="30" fill="{MUTED}">{tagline}</text>
 </svg>"##,
         wordmark = wordmark_svg(72.0, 72.0),
-        coin = coin_block(&family, card.rank(), tier),
         tagline = esc(tagline_for(card)),
     )
 }
@@ -298,37 +280,6 @@ fn avatar_block(family: &str, avatar_png: Option<&[u8]>, name: &str) -> String {
             )
         }
     }
-}
-
-/// The Verification Coin. Fill carries tier, ring carries point of view.
-/// Label-less by design — see CONTEXT.md.
-fn coin_block(family: &str, rank: Option<i64>, tier: Tier) -> String {
-    let text = tier.text_color();
-    let value = esc(&rank
-        .map(|r| r.to_string())
-        .unwrap_or_else(|| "—".to_string()));
-
-    let body = match tier.fill() {
-        Some(fill) => format!(
-            r#"<circle cx="{COIN_CX}" cy="{COIN_CY}" r="{COIN_R}" fill="{fill}"/>
-<circle cx="{COIN_CX}" cy="{COIN_CY}" r="{sep_r}" fill="none" stroke="{SURFACE}" stroke-width="{COIN_RING_STEP}"/>
-<circle cx="{COIN_CX}" cy="{COIN_CY}" r="{pov_r}" fill="none" stroke="{POV_GLOBAL}" stroke-width="{COIN_RING_STEP}"/>"#,
-            sep_r = COIN_R + COIN_RING_STEP / 2.0,
-            pov_r = COIN_R + COIN_RING_STEP * 1.5,
-        ),
-        // No score is an OUTLINE, not another grey fill — absence of a number
-        // is a difference in kind, and the POV ring is suppressed with it.
-        None => format!(
-            r#"<circle cx="{COIN_CX}" cy="{COIN_CY}" r="{COIN_R}" fill="{SURFACE}" stroke="{TRACK}" stroke-width="4" stroke-dasharray="12 10"/>"#
-        ),
-    };
-
-    format!(
-        r#"{body}
-<text x="{COIN_CX}" y="{COIN_CY}" font-family="{family}" font-size="{size}" font-weight="700" fill="{text}" text-anchor="middle" dominant-baseline="central">{value}</text>"#,
-        // 0.4 of the diameter, matching the coin's own `fontSize` rule.
-        size = (COIN_R * 2.0 * 0.4).round(),
-    )
 }
 
 /// Drop control characters and bidi overrides — an RTL override in a display

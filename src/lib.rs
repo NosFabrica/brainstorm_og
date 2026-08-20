@@ -6,7 +6,6 @@ pub mod relay;
 pub mod render;
 pub mod routes;
 pub mod state;
-pub mod tier;
 
 use axum::{http::StatusCode, routing::get, Router};
 use std::time::Duration;

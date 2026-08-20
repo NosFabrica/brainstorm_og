@@ -11,48 +11,37 @@ preview image. "OG" survives only in protocol names (`og:image`, `/og/`).
 **Unfurl**: what a third-party crawler does with a share link. _Avoid_: preview,
 embed.
 
-**Rank**: the published 0–100 integer, `round(Influence × 100)`. Same meaning as
-the server glossary. Never drawn with a label — see below.
-
 **Provisional card**: one assembled without a kind-0. Short TTL so it
 self-corrects rather than pinning a name-less card.
 
 ## Decisions
 
-### The card is the house view, and says so only in alt text
+### The card publishes no score
 
-`/overview` is called anonymously, so the server resolves the default (house)
-observer. The coin is therefore always the *global* point of view and never uses
-the personalized ring. The image alt text mirrors the coin's own aria-label
-("…verification score 98 out of 100, global view"); the card itself carries no
-label, because `VerificationCoin` is deliberately label-less and the words
-"Verification Score" live only in the in-app explainer.
+No coin, no tier, no number — on the card or in the meta description. An unfurl
+lands in front of someone with no stated point of view, no explainer and no
+recourse, and it is auto-generated for any pubkey anyone chooses to paste. The
+score stays in-app where all three of those exist.
 
-### `flagged` is never surfaced
+This also removed the `flagged` question entirely. Previously the card clamped
+to the unverified floor so a reported account never rendered red; now there is
+nothing to clamp.
 
-`UserOverviewData` carries `flagged_by_observer`/`flagged_count` and there is a
-red flagged band. The card clamps to the unverified floor instead. This card is
-auto-generated for any pubkey anyone pastes, on our domain, with no appeal path:
-a grey "no signal on this person" is fair to publish that way, a red "trusted
-people reported them" is not. Flagging stays in-app, where there is context and
-recourse.
-
-### Tier comes from the server; only its presentation is duplicated
-
-The bands live in `app/core/tier_thresholds.py` and are the only thing that
-knows the observer's verified line. We consume the `tier` bucket and map it to
-fill/text colour locally. The duplication is asymmetric on purpose: a stale
-colour is visible and harmless, a stale threshold would be a wrong score. Text
-colours come from `DARK_TEXT_TIERS`, which derives them from measured WCAG
-contrast — white on Aurora Cyan is 1.85:1, so "just use white" is wrong.
+`/overview` is still called, but only for the follower and following counts in
+the meta description. The `tier` bucket it returns is ignored.
 
 ### Metadata comes from the relay, not Vespa
 
-Vespa is downstream of strfry via the redis ingest queue, so the relay's
-coverage is a strict superset and cannot lag ingest. One in-cluster relay, from
-config — not the original six-relay public fan-out, which is what produced a
-~12s worst case, and not `nprofile` hints, which are attacker-supplied
-addresses. Hints are parsed (the TLV walk must step over them) and discarded.
+One in-cluster relay, from config — not the original six-relay public fan-out,
+which is what produced a ~12s worst case, and not `nprofile` hints, which are
+attacker-supplied addresses. Hints are parsed (the TLV walk must step over them)
+and discarded.
+
+That relay is **neofry**, not strfry. neofry is the data ingress — the router
+streams kind 0 into it — while strfry is the read-only egress and is synced
+separately. Pointed at strfry on staging, every lookup returned "no kind-0
+event" and every card rendered a truncated npub instead of a name: the relay
+answered, it just had nothing.
 
 ### The request `Host` header is never read
 
@@ -64,13 +53,23 @@ crawler arriving on a legacy alias still consolidates onto the canonical domain.
 reasons, but `brainstorm.world` is canonical — so this is set explicitly, not
 inferred from list order.
 
-### Image URLs are content-addressed
+### Image URLs are content-addressed, plus a render epoch
 
-`og:image` carries `?v={hash}` over name, picture, nip05, rank and tier. HTML
-gets a short `max-age`, images a long immutable one. A changed avatar or rank
-yields a new URL within minutes; already-shared messages keep the card that was
-true when shared. Whatever the tagline eventually becomes, it must be **stable
-for a given card** or it desyncs from the hash.
+`og:image` carries `?v={hash}` over exactly what the card draws — name, picture,
+nip05 — and nothing else. Counts and scores are excluded on purpose: they move
+constantly and are not drawn, so hashing them would mint a new URL for a
+byte-identical image on every GrapeRank run.
+
+The hash also folds in `RENDER_EPOCH`, because a hash over inputs cannot express
+"the renderer changed". Without it a visual fix produces identical URLs and
+never reaches anything already holding one — and those are served immutable for
+a year. This bit us twice in one day: an avatar fix and the coin removal both
+left cached cards stale. The chart sets it from the Helm release revision, since
+staging rides a mutable image tag and a tag-derived value would be constant
+across exactly the deploys that most need to propagate.
+
+Whatever the tagline eventually becomes, it must be **stable for a given card**
+or it desyncs from the hash.
 
 Limits: only helps crawlers that re-fetch the page, and `?v=` must become a path
 segment if a CDN that strips query strings is ever put in front.

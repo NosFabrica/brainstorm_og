@@ -139,15 +139,11 @@ fn build_meta_html(st: &AppState, id: &str, card: &Card) -> String {
 
     // From config, never the request Host. See CONTEXT.md.
     let page_url = esc(&format!("{app}/p/{id}"));
-    let image_url = esc(&format!("{app}/og/{id}.png?v={}", card.version()));
-    // Mirrors VerificationCoin's aria-label; always the house perspective.
-    let image_alt = esc(&match card.rank() {
-        Some(r) => format!(
-            "{} — verification score {r} out of 100, global view",
-            card.display_name()
-        ),
-        None => format!("{} — unrated, global view", card.display_name()),
-    });
+    let image_url = esc(&format!(
+        "{app}/og/{id}.png?v={}",
+        card.version(&st.config.render_epoch)
+    ));
+    let image_alt = esc(&format!("{} on Brainstorm", card.display_name()));
 
     format!(
         r#"<!doctype html>
@@ -189,16 +185,12 @@ fn meta_description(card: &Card) -> String {
         }
     }
     match &card.overview {
-        Some(o) => {
-            let rank = card
-                .rank()
-                .map(|r| format!("Verification score {r} · "))
-                .unwrap_or_default();
-            format!(
-                "{rank}{} followers · {} following on Brainstorm.",
-                o.followers, o.following
-            )
-        }
+        // Deliberately no score here either — the card does not show one, and
+        // putting it in the description would still be publishing it.
+        Some(o) => format!(
+            "{} followers · {} following on Brainstorm.",
+            o.followers, o.following
+        ),
         None => "A Nostr profile on Brainstorm — the Web of Trust layer for Nostr.".to_string(),
     }
 }
@@ -227,6 +219,8 @@ fn esc(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const EPOCH: &str = "test-epoch";
     use crate::data::{Overview, ProfileMeta};
 
     fn card_with(about: Option<&str>, influence: Option<f64>) -> Card {
@@ -269,12 +263,18 @@ mod tests {
         );
         // Whitespace-only `about` must fall through, not render blank.
         let s = meta_description(&card_with(Some("   "), Some(0.4)));
-        assert!(s.contains("Verification score 40"), "got {s}");
-        assert!(s.contains("12 followers"));
+        assert!(s.contains("12 followers"), "got {s}");
+        assert!(s.contains("34 following"), "got {s}");
 
-        // No score at all: no dangling prefix.
-        let s = meta_description(&card_with(None, None));
-        assert!(!s.contains("Verification score"), "got {s}");
+        // The score is never published — not on the card, not here.
+        for c in [card_with(None, Some(0.98)), card_with(None, None)] {
+            let s = meta_description(&c).to_lowercase();
+            assert!(
+                !s.contains("score"),
+                "score leaked into the description: {s}"
+            );
+            assert!(!s.contains("98"), "score leaked into the description: {s}");
+        }
     }
 
     #[test]
@@ -286,11 +286,11 @@ mod tests {
             "{}/og/{}.png?v={}",
             st_cfg.app_base_url,
             "npubxyz",
-            card.version()
+            card.version(EPOCH)
         );
         assert!(url.contains("?v="));
-        // And it must move when the rendered content moves.
+        // A differing score leaves it alone — the card does not draw one.
         let other = card_with(None, Some(0.55));
-        assert_ne!(card.version(), other.version());
+        assert_eq!(card.version(EPOCH), other.version(EPOCH));
     }
 }

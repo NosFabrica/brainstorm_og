@@ -33,6 +33,7 @@ fn router() -> axum::Router {
         request_deadline_secs: 2,
         avatar_max_bytes: 1024 * 1024,
         max_concurrent_renders: 4,
+        render_epoch: "test".into(),
         assets_dir: "assets".into(),
         font_family: "Figtree".into(),
     };

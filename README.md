@@ -21,44 +21,46 @@ the SPA's generic card rather than breaking anything.
 
 ## The card
 
-Built from the UI's design tokens: the dark surface from `YourNetworkCard`'s
-dark variant, the brand wordmark, the avatar, and the **Verification Coin**
-(`components/score/VerificationCoin.tsx`) pinned to the avatar's corner —
-deliberately label-less, fill carrying tier and the ring carrying point of view.
+Identity only: the dark surface from `YourNetworkCard`'s dark variant, the
+brand wordmark, the avatar, the display name and nip05.
+
+**No score.** The card shows no verification score, tier or coin, and neither
+does the meta description — an unfurl reaches people with no context and no
+recourse, so we don't publish a number about someone there. The score stays
+in-app, where it has a stated point of view and an explainer next to it.
 
 This is not a copy of the app's in-app share panel, which is a separate surface
 with a different audience and is free to look different.
 
-Always the **global (house)** perspective. There is no viewer to personalise
-for, so the coin never uses the personalized purple ring.
-
-`flagged` is deliberately never surfaced. The card is auto-generated for any
-pubkey anyone chooses to paste, on our domain, with no appeal path — a grey
-"no signal on this person" is fair to publish that way, a red "trusted people
-reported them" is not. It clamps to the unverified floor; flagging stays in-app
-where there is context and recourse.
-
 ## Data sources
 
-- **Rank + tier**: one cached call to `GET {API_BASE_URL}/user/{hex}/overview`.
-  The tier bucket is taken from the response rather than re-derived — the bands
-  live in `brainstorm_server/app/core/tier_thresholds.py` and must not be
-  duplicated into a second language. Because the call is anonymous, the server
-  resolves the default (house) observer for us.
 - **Metadata** (name/avatar/nip05): kind-0 from the in-cluster relay, and only
   that one. Not a public fan-out — that is what made the original design slow —
   and not Vespa, which is downstream of the relay via the redis ingest queue.
   `nprofile` relay hints are parsed but never dialled.
+- **Relationship counts**: one cached call to
+  `GET {API_BASE_URL}/user/{hex}/overview`, used solely for the follower and
+  following numbers in the meta description. The score it also returns is
+  ignored.
 
 Everything is cached in a bounded in-memory LRU (no disk).
 
 ## Cache invalidation
 
-`og:image` carries a content hash: `/og/{id}.png?v={hash}` over the name,
-picture, nip05, rank and tier. The HTML is served with a short `max-age` and the
-image with a long immutable one, so a changed avatar or rank produces a new
-image URL within minutes, while already-shared messages keep the card that was
-true when they were shared. Old `?v=` URLs stay valid forever.
+`og:image` carries a content hash: `/og/{id}.png?v={hash}` over exactly what the
+card draws — name, picture, nip05 — plus `RENDER_EPOCH`. The HTML is served with
+a short `max-age` and the image with a long immutable one, so a changed avatar
+produces a new image URL within minutes, while already-shared messages keep the
+card that was true when they were shared. Old `?v=` URLs stay valid forever.
+
+Counts and scores are deliberately **not** hashed: they move constantly and the
+card doesn't draw them, so including them would mint a new URL for a
+byte-identical image on every GrapeRank run.
+
+`RENDER_EPOCH` is the escape hatch for the opposite problem. A hash over inputs
+alone cannot express "the renderer changed", so a visual fix would produce
+identical URLs and never reach anything already holding one. The chart sets it
+from the Helm release revision, so each upgrade issues fresh URLs.
 
 This only helps crawlers that re-fetch the page — nothing forces Facebook to
 re-scrape. If a CDN is ever put in front that strips query strings from cache
@@ -111,9 +113,10 @@ container; the caches are in-memory, so restarting is what resets them.
 | `HTML_CACHE_MAX_AGE` | `300` | meta HTML `Cache-Control` |
 | `IMAGE_CACHE_MAX_AGE` | `31536000` | card `Cache-Control`, immutable |
 | `FETCH_TIMEOUT_SECS` | `3` | per upstream call |
-| `AVATAR_TIMEOUT_SECS` | `2` | avatar image fetch |
+| `AVATAR_TIMEOUT_SECS` | `5` | avatar image fetch |
 | `AVATAR_MAX_BYTES` | `5242880` (5 MB) | body cap before decode |
 | `REQUEST_DEADLINE_SECS` | `4` | whole-request budget |
+| `RENDER_EPOCH` | crate version | salt for `?v=`; bump to force re-render |
 | `MAX_CONCURRENT_RENDERS` | `32` | in-flight card renders; queues past this |
 | `ASSETS_DIR` | `assets` | bundled fonts |
 | `FONT_FAMILY` | `Figtree` | must match a family in `ASSETS_DIR` |

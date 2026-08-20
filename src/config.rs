@@ -29,6 +29,14 @@ pub struct Config {
     /// In-flight renders. Stampede protection coalesces the same pubkey; this
     /// bounds a burst of distinct ones, each of which costs a fetch and a raster.
     pub max_concurrent_renders: usize,
+    /// Salt folded into the `?v=` image hash.
+    ///
+    /// The hash otherwise covers only the card's INPUTS, so a change to how the
+    /// card is *drawn* produces identical URLs and never reaches anything that
+    /// already cached one — and those are served immutable for a year. Setting
+    /// this to something that moves per deploy (the image tag) makes a visual
+    /// change propagate. Defaults to the crate version.
+    pub render_epoch: String,
     /// Directory with the bundled fonts.
     pub assets_dir: String,
     /// Must match a family in `assets_dir`. Not inferred from load order.
@@ -73,6 +81,7 @@ impl Config {
             request_deadline_secs: parse("REQUEST_DEADLINE_SECS", 4),
             avatar_max_bytes: parse("AVATAR_MAX_BYTES", 5 * 1024 * 1024),
             max_concurrent_renders: parse("MAX_CONCURRENT_RENDERS", 32),
+            render_epoch: var("RENDER_EPOCH", env!("CARGO_PKG_VERSION")),
             assets_dir: var("ASSETS_DIR", "assets"),
             font_family: var("FONT_FAMILY", "Figtree"),
         }
