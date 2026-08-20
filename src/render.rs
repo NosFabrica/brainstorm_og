@@ -56,7 +56,15 @@ const WORDMARK_H: f32 = WORDMARK_W * 0.23;
 /// Render a profile card to PNG. Missing avatar / metadata degrade gracefully.
 pub async fn render_card(state: &AppState, card: &Card) -> Result<Vec<u8>> {
     let avatar = match &card.meta.picture {
-        Some(url) => fetch_avatar(state, url).await.ok(),
+        Some(url) => match fetch_avatar(state, url).await {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                // Silently dropping this made a missing avatar indistinguishable
+                // from a profile that has none.
+                tracing::warn!("avatar fetch failed for {url}: {e:#}");
+                None
+            }
+        },
         None => None,
     };
     let svg = build_svg(state, card, avatar.as_deref());
@@ -80,15 +88,41 @@ pub async fn render_fallback(state: &AppState) -> Option<Vec<u8>> {
 /// `net` validates the address, the size cap and dimension check are here.
 async fn fetch_avatar(state: &AppState, url: &str) -> Result<Vec<u8>> {
     let max = state.config.avatar_max_bytes;
-    let url = crate::net::validate_and_resolve(url, &["http", "https"]).await?;
+    let mut target = crate::net::validate_and_resolve(url, &["http", "https"]).await?;
 
-    let resp = state
-        .avatar_http
-        .get(url)
-        .timeout(Duration::from_secs(state.config.avatar_timeout_secs))
-        .send()
-        .await?
-        .error_for_status()?;
+    // Redirects are followed here rather than by reqwest, which is configured
+    // not to: its policy runs before we can re-check the destination, so an
+    // automatic follow would let a public URL bounce us to an internal one.
+    // Following manually means every hop goes back through the same address
+    // validation. Without this, a 3xx sailed past `error_for_status`, its empty
+    // body failed format detection, and the avatar silently vanished.
+    let mut resp;
+    let mut hops = 0;
+    loop {
+        resp = state
+            .avatar_http
+            .get(target.clone())
+            .timeout(Duration::from_secs(state.config.avatar_timeout_secs))
+            .send()
+            .await?;
+
+        if !resp.status().is_redirection() {
+            break;
+        }
+        hops += 1;
+        if hops > 3 {
+            return Err(anyhow!("too many redirects"));
+        }
+        let location = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| anyhow!("{} with no Location header", resp.status()))?;
+        // Relative Locations are legal and common.
+        let next = target.join(location)?;
+        target = crate::net::validate_and_resolve(next.as_str(), &["http", "https"]).await?;
+    }
+    let resp = resp.error_for_status()?;
 
     // Cheap rejection when the server is honest about the size...
     if let Some(len) = resp.content_length() {

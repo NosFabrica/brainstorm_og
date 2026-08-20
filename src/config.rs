@@ -69,7 +69,7 @@ impl Config {
             image_cache_max_age: parse("IMAGE_CACHE_MAX_AGE", 31_536_000),
             provisional_ttl_secs: parse("PROVISIONAL_TTL_SECS", 60),
             fetch_timeout_secs: parse("FETCH_TIMEOUT_SECS", 3),
-            avatar_timeout_secs: parse("AVATAR_TIMEOUT_SECS", 2),
+            avatar_timeout_secs: parse("AVATAR_TIMEOUT_SECS", 5),
             request_deadline_secs: parse("REQUEST_DEADLINE_SECS", 4),
             avatar_max_bytes: parse("AVATAR_MAX_BYTES", 5 * 1024 * 1024),
             max_concurrent_renders: parse("MAX_CONCURRENT_RENDERS", 32),

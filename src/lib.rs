@@ -16,7 +16,12 @@ use tower_http::{catch_panic::CatchPanicLayer, timeout::TimeoutLayer, trace::Tra
 use crate::state::AppState;
 
 pub fn build_router(state: AppState) -> Router {
-    let request_timeout = Duration::from_secs(state.config.request_deadline_secs + 2);
+    // Card assembly and the avatar fetch are sequential and separately bounded,
+    // so the request budget has to cover both or the layer 504s a render that
+    // was going to succeed.
+    let request_timeout = Duration::from_secs(
+        state.config.request_deadline_secs + state.config.avatar_timeout_secs + 2,
+    );
     let max_renders = state.config.max_concurrent_renders;
 
     Router::new()
