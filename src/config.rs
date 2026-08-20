@@ -28,6 +28,10 @@ pub struct Config {
     pub avatar_max_bytes: u64,
     /// In-flight renders. Stampede protection coalesces the same pubkey; this
     /// bounds a burst of distinct ones, each of which costs a fetch and a raster.
+    ///
+    /// Also the memory bound that matters: each render holds a ~3 MB pixmap plus
+    /// a decoded avatar (capped at 32 MB), so this multiplies against the
+    /// container limit. 8 x 32 MB plus the 64 MB card cache fits 512Mi.
     pub max_concurrent_renders: usize,
     /// Salt folded into the `?v=` image hash.
     ///
@@ -80,7 +84,7 @@ impl Config {
             avatar_timeout_secs: parse("AVATAR_TIMEOUT_SECS", 5),
             request_deadline_secs: parse("REQUEST_DEADLINE_SECS", 4),
             avatar_max_bytes: parse("AVATAR_MAX_BYTES", 5 * 1024 * 1024),
-            max_concurrent_renders: parse("MAX_CONCURRENT_RENDERS", 32),
+            max_concurrent_renders: parse("MAX_CONCURRENT_RENDERS", 8),
             render_epoch: var("RENDER_EPOCH", env!("CARGO_PKG_VERSION")),
             assets_dir: var("ASSETS_DIR", "assets"),
             font_family: var("FONT_FAMILY", "Figtree"),

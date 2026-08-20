@@ -31,6 +31,25 @@ const AV_RADIUS: f32 = 56.0;
 
 const TEXT_X: f32 = 424.0;
 
+/// What the avatar is re-encoded to before being embedded. Derived from the
+/// drawn size so the two cannot drift: the card is rasterised 1:1 at its
+/// viewBox, so anything above `AV_SIZE` is bytes nobody sees, and anything
+/// below is upscaled and blurry. It used to be a hardcoded 240 against a 300px
+/// box, which was exactly that.
+const AVATAR_PX: u32 = AV_SIZE as u32;
+
+/// Ceilings for DECODING an attacker-supplied avatar, which is unavoidably the
+/// full source resolution — `image` has no scaling decoder. Decoded RGBA costs
+/// width*height*4, so this is the transient allocation `MAX_CONCURRENT_RENDERS`
+/// multiplies against the container's memory limit: 2048^2 * 4 = 16 MB, times 8
+/// concurrent, plus the card cache, fits 512Mi.
+///
+/// Not lowered to `AVATAR_PX`: real profile pictures are routinely 1000-2000px,
+/// and this rejects rather than resamples, so a tight cap would drop avatars
+/// rather than shrink them.
+const MAX_AVATAR_DIM: u32 = 2048;
+const MAX_AVATAR_ALLOC: u64 = 32 * 1024 * 1024;
+
 /// Compiled in, not read from `ASSETS_DIR`, so a bad path cannot strip the
 /// card's branding. Its own fill is slate-50, matching `INK`.
 const WORDMARK: &str = include_str!("../assets/wordmark-white.svg");
@@ -143,25 +162,33 @@ async fn fetch_avatar(state: &AppState, url: &str) -> Result<Vec<u8>> {
         return Err(anyhow!("unsupported avatar format {format:?}"));
     }
 
-    // Check the declared dimensions BEFORE decoding. `resize_to_fill` shrinks
-    // to 240x240, but only after a full decode — a 30000x30000 PNG would
-    // allocate gigabytes first.
+    // Check the declared dimensions BEFORE decoding. The resize happens only
+    // after a full decode, so a 30000x30000 PNG would allocate gigabytes first.
+    //
+    // The ceiling is deliberately close to what the output needs. Decoded RGBA
+    // is width*height*4, so 4096 is already ~67 MB for one image; the previous
+    // 8192 was ~268 MB, and MAX_CONCURRENT_RENDERS of those at once dwarfed the
+    // container's memory limit.
     let (w, h) = reader.into_dimensions()?;
-    if w > 8192 || h > 8192 {
-        return Err(anyhow!("avatar is {w}x{h}, over the 8192 limit"));
+    if w > MAX_AVATAR_DIM || h > MAX_AVATAR_DIM {
+        return Err(anyhow!(
+            "avatar is {w}x{h}, over the {MAX_AVATAR_DIM} limit"
+        ));
     }
 
     let mut reader = image::ImageReader::new(Cursor::new(&body)).with_guessed_format()?;
     reader.limits({
         let mut l = image::Limits::default();
-        l.max_image_width = Some(8192);
-        l.max_image_height = Some(8192);
-        l.max_alloc = Some(128 * 1024 * 1024);
+        l.max_image_width = Some(MAX_AVATAR_DIM);
+        l.max_image_height = Some(MAX_AVATAR_DIM);
+        l.max_alloc = Some(MAX_AVATAR_ALLOC);
         l
     });
-    let img = reader
-        .decode()?
-        .resize_to_fill(240, 240, image::imageops::FilterType::Lanczos3);
+    let img = reader.decode()?.resize_to_fill(
+        AVATAR_PX,
+        AVATAR_PX,
+        image::imageops::FilterType::Lanczos3,
+    );
 
     let mut out = Cursor::new(Vec::new());
     img.write_to(&mut out, image::ImageFormat::Png)?;
