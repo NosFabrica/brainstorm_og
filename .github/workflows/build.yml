@@ -21,7 +21,7 @@ jobs:
     name: Lint and test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -30,10 +30,13 @@ jobs:
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - run: cargo test --locked --all-features
       # The image decoder and TLS stacks here are fed attacker-controlled bytes,
-      # so advisories matter more than usual.
-      - uses: rustsec/audit-check@v2
+      # so advisories matter more than usual. Run the tool directly rather than
+      # via rustsec/audit-check, which has no release past v2.0.0 and still
+      # targets the deprecated Node 20 runtime.
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+      - run: cargo audit
 
   build:
     name: Build and push image
@@ -44,12 +47,12 @@ jobs:
       packages: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Lint Dockerfile
-        uses: hadolint/hadolint-action@v3.3.0
+        uses: hadolint/hadolint-action@v3.4.0
         with:
           dockerfile: Dockerfile
           ignore: DL3008,DL3018,DL3059
@@ -62,7 +65,7 @@ jobs:
 
       - name: Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: |
             ${{ steps.img.outputs.name }}
@@ -75,17 +78,17 @@ jobs:
             type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile

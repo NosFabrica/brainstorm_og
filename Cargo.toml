@@ -51,9 +51,13 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 
 [profile.release]
-opt-level = "z"
-lto = true
-codegen-units = 1
+# Tuned for build time and render speed, not binary size. Size buys little
+# here — the image is `scratch` and the fonts are ~19 MB against a ~6 MB
+# binary — while `opt-level = "z"` + fat LTO + one codegen unit linked all 372
+# transitive deps single-threaded and dominated a ~4 min CI build.
+opt-level = 3
+lto = "thin"
+codegen-units = 16
 strip = true
 # NOTE: deliberately NOT `panic = "abort"`. This process decodes
 # attacker-supplied images and rasterises attacker-influenced text; a panic in
