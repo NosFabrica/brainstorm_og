@@ -51,13 +51,25 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 
 [profile.release]
-# Tuned for build time and render speed, not binary size. Size buys little
-# here — the image is `scratch` and the fonts are ~19 MB against a ~6 MB
-# binary — while `opt-level = "z"` + fat LTO + one codegen unit linked all 372
-# transitive deps single-threaded and dominated a ~4 min CI build.
-opt-level = 3
-lto = "thin"
-codegen-units = 16
+# Measured, not assumed. On a CPU-bound CI runner what matters is total CPU,
+# not wall time on a many-core dev machine — and this is the cheapest by a wide
+# margin. Full clean release builds, same machine:
+#
+#   z  / fat lto  / cgu=1   229s CPU   10.0MB   <- this
+#   3  / thin lto / cgu=16  285s CPU   15.8MB
+#   z  / thin lto / cgu=16  295s CPU   15.8MB
+#   z  / no lto   / cgu=4   292s CPU   14.7MB
+#
+# cgu=1 avoids duplicated codegen across units and fat LTO discards a lot
+# before optimising. Raising codegen-units halves wall time on a 10-core
+# laptop and makes CI slower, which is the trap this comment exists to stop.
+#
+# If build time needs to come down, the lever is the duplicated compile — the
+# test job and the Docker build compile independently under separate caches —
+# not this profile.
+opt-level = "z"
+lto = true
+codegen-units = 1
 strip = true
 # NOTE: deliberately NOT `panic = "abort"`. This process decodes
 # attacker-supplied images and rasterises attacker-influenced text; a panic in
