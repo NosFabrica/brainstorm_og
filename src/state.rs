@@ -19,6 +19,8 @@ pub struct AppState {
     pub avatar_http: reqwest::Client,
     pub fontdb: Arc<fontdb::Database>,
     pub card_cache: Cache<String, Card>,
+    /// Short code -> hex pubkey. Immutable once minted, so no TTL.
+    pub short_code_cache: Cache<String, String>,
     pub png_cache: Cache<String, Bytes>,
 }
 
@@ -78,6 +80,12 @@ impl AppState {
                 normal: ttl,
             })
             .build();
+        // Shares CACHE_MAX_ENTRIES with the card cache: both are per-profile in
+        // practice, and a second knob for a map of two short strings would be
+        // more configuration than it is worth.
+        let short_code_cache = Cache::builder()
+            .max_capacity(config.card_cache_capacity)
+            .build();
         let png_cache = Cache::builder()
             .weigher(|_k: &String, v: &Bytes| v.len().min(u32::MAX as usize) as u32)
             .max_capacity(config.png_cache_max_bytes)
@@ -90,6 +98,7 @@ impl AppState {
             avatar_http,
             fontdb: Arc::new(db),
             card_cache,
+            short_code_cache,
             png_cache,
         })
     }

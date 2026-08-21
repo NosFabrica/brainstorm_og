@@ -224,6 +224,80 @@ async fn fetch_meta(state: &AppState, hex: &str) -> Option<ProfileMeta> {
     meta.is_useful().then_some(meta)
 }
 
+#[derive(Deserialize)]
+struct ShortUrlEnvelope {
+    data: ShortUrlData,
+}
+#[derive(Deserialize)]
+struct ShortUrlData {
+    pubkey: String,
+}
+
+/// Resolve a short code to its hex pubkey, or `None` if it doesn't resolve.
+///
+/// `None` covers "no such code", "the API is unreachable" and "the API answered
+/// with something that isn't a pubkey". The caller must not invent a card in
+/// any of them: a preview claiming a profile that doesn't exist is worse than
+/// no preview.
+///
+/// Cached without a TTL — a code's mapping is immutable once minted. The
+/// accepted consequence is that a code deleted upstream stays resolvable here
+/// until capacity evicts it. Failures are not cached, so a code minted after a
+/// crawler first tried it still resolves.
+pub async fn resolve_short_code(state: &AppState, code: &str) -> Option<String> {
+    let key = normalize_short_code(code);
+    if key.is_empty() {
+        return None;
+    }
+
+    // try_get_with, not get + insert: crawlers arrive in bursts for one link,
+    // and this coalesces them onto a single in-flight lookup — the same
+    // stampede protection get_card relies on. Errors are not cached.
+    state
+        .short_code_cache
+        .try_get_with(key.clone(), fetch_short_code(state, &key))
+        .await
+        .ok()
+}
+
+/// Match the server's folding (`normalize_short_code` in `shorturl_service.py`)
+/// so one mapping is one cache entry: Crockford excludes I, L, O and U, and
+/// resolution folds the first three back to digits.
+fn normalize_short_code(code: &str) -> String {
+    code.trim()
+        .to_uppercase()
+        .replace(['I', 'L'], "1")
+        .replace('O', "0")
+}
+
+async fn fetch_short_code(state: &AppState, key: &str) -> Result<String> {
+    let url = format!("{}/shorturl/{}", state.config.api_base_url, key);
+    let resp = state
+        .http
+        .get(&url)
+        .timeout(Duration::from_secs(state.config.fetch_timeout_secs))
+        .send()
+        .await?;
+
+    // A 404 is routine — someone pasted a dead link. A 5xx is not.
+    if !resp.status().is_success() {
+        if resp.status().is_server_error() {
+            tracing::warn!("short code {key} -> HTTP {}", resp.status());
+        } else {
+            tracing::debug!("short code {key} -> HTTP {}", resp.status());
+        }
+        anyhow::bail!("short code {key} did not resolve");
+    }
+
+    let env: ShortUrlEnvelope = resp.json().await?;
+    let hex = env.data.pubkey.trim().to_lowercase();
+    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        tracing::warn!("short code {key} resolved to a non-pubkey");
+        anyhow::bail!("short code {key} resolved to a non-pubkey");
+    }
+    Ok(hex)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

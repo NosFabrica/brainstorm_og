@@ -1,6 +1,7 @@
 # brainstorm-og
 
-Renders the share card and crawler-visible meta tags for `/p/{id}`. Replaces
+Renders the share card and crawler-visible meta tags for `/p/{id}` and for the
+short share links `/s/{code}` resolve to. Replaces
 `Brainstorm-UI`'s `useShareMeta.ts`, a client-side stopgap invisible to crawlers.
 
 ## Language
@@ -13,6 +14,11 @@ embed.
 
 **Provisional card**: one assembled without a kind-0. Short TTL so it
 self-corrects rather than pinning a name-less card.
+
+**Short link / code**: `/s/{code}`, where the code stands in for a pubkey plus
+relay hints. Say "code" for the identifier and "short link" for the URL — not
+"short url", which reads as either. Minted by `brainstorm_server`; immutable
+once minted, which is why resolution is cached without a TTL.
 
 ## Decisions
 

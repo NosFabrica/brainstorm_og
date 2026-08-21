@@ -16,6 +16,12 @@ the SPA's generic card rather than breaking anything.
   `Brainstorm-UI/client/src/lib/shareId.ts` accepts.
 - `GET /profile/{id}` → the same, kept only for links already in the wild.
   `og:url` and `canonical` still point at `/p/`.
+- `GET /s/{code}` → the same card for a **short share link**. The code is
+  resolved to a pubkey via the API and cached; `og:url` and `canonical` point at
+  `/p/`, since the card names the profile rather than the link to it. An
+  unresolvable code is a 404, never a card for a profile that doesn't exist.
+  Registered under `/S/` too: the QR payload is uppercase, and nginx proxies the
+  URI unchanged.
 - `GET /og/{id}.png?v={hash}` → 1200×630 PNG card.
 - `GET /healthz` → JSON with the loaded font family and face count.
 
@@ -146,7 +152,7 @@ curl -s localhost:8080/og/$NPUB.png -o card.png
 
 ## Routing (who reaches this service)
 
-The UI pod's own nginx sends crawler User-Agents on `/p/*` here, and all of
-`/og/*` for everyone. Deliberately not the ingress: staging and prod share a
+The UI pod's own nginx sends crawler User-Agents on `/p/*` and `/s/*` here (the
+latter matched case-insensitively), and all of `/og/*` for everyone. Deliberately not the ingress: staging and prod share a
 cluster, so a map in the shared controller config would carry prod blast radius.
 See [`deploy/README.md`](deploy/README.md); the reasoning is in [`CONTEXT.md`](CONTEXT.md).
