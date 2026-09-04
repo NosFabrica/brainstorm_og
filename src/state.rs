@@ -17,6 +17,9 @@ pub struct AppState {
     /// Attacker-controlled avatar URLs. No redirects: one would bypass the
     /// pre-connect address check.
     pub avatar_http: reqwest::Client,
+    /// Third-party pages named in notes. Same no-redirect reasoning as
+    /// `avatar_http`, plus an honest bot identity we never disguise.
+    pub preview_http: reqwest::Client,
     pub fontdb: Arc<fontdb::Database>,
     pub card_cache: Cache<String, Card>,
     /// Short code -> hex pubkey. Immutable once minted, so no TTL.
@@ -71,6 +74,12 @@ impl AppState {
             .build()
             .context("building avatar client")?;
 
+        let preview_http = reqwest::Client::builder()
+            .user_agent(crate::link_preview::USER_AGENT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("building link preview client")?;
+
         let ttl = Duration::from_secs(config.cache_ttl_secs);
         let card_cache = Cache::builder()
             .max_capacity(config.card_cache_capacity)
@@ -96,6 +105,7 @@ impl AppState {
             config: Arc::new(config),
             http,
             avatar_http,
+            preview_http,
             fontdb: Arc::new(db),
             card_cache,
             short_code_cache,

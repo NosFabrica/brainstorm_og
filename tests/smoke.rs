@@ -36,6 +36,10 @@ fn router() -> axum::Router {
         render_epoch: "test".into(),
         assets_dir: "assets".into(),
         font_family: "Figtree".into(),
+        link_preview_timeout_secs: 1,
+        link_preview_deadline_secs: 2,
+        link_preview_max_bytes: 64 * 1024,
+        allow_loopback_preview_targets: false,
     };
     build_router(AppState::new(config).expect("fonts must load from assets/"))
 }

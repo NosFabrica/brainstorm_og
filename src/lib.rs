@@ -1,5 +1,6 @@
 pub mod config;
 pub mod data;
+pub mod link_preview;
 pub mod net;
 pub mod nip19;
 pub mod relay;
@@ -7,20 +8,20 @@ pub mod render;
 pub mod routes;
 pub mod state;
 
-use axum::{http::StatusCode, routing::get, Router};
+use axum::{extract::Request, http::StatusCode, routing::get, Router};
 use std::time::Duration;
 use tower::{limit::ConcurrencyLimitLayer, ServiceBuilder};
 use tower_http::{catch_panic::CatchPanicLayer, timeout::TimeoutLayer, trace::TraceLayer};
 
 use crate::state::AppState;
 
+/// The filter `main` installs when `RUST_ENV_FILTER` says nothing. Here rather
+/// than in `main` so the test that pins what reaches the logs uses the same
+/// string production does.
+pub const DEFAULT_LOG_FILTER: &str = "brainstorm_og=info,tower_http=warn";
+
 pub fn build_router(state: AppState) -> Router {
-    // Card assembly and the avatar fetch are sequential and separately bounded,
-    // so the request budget has to cover both or the layer 504s a render that
-    // was going to succeed.
-    let request_timeout = Duration::from_secs(
-        state.config.request_deadline_secs + state.config.avatar_timeout_secs + 2,
-    );
+    let request_timeout = Duration::from_secs(state.config.router_timeout_secs());
     let max_renders = state.config.max_concurrent_renders;
 
     Router::new()
@@ -54,10 +55,13 @@ pub fn build_router(state: AppState) -> Router {
             "/og/{id}",
             get(routes::og_image).layer(ConcurrencyLimitLayer::new(max_renders)),
         )
+        // A third-party page, fetched because a human opened a note that links
+        // to it. The inverse of an unfurl — see CONTEXT.md.
+        .route("/link-preview", get(link_preview::link_preview))
         .with_state(state)
         .layer(
             ServiceBuilder::new()
-                .layer(TraceLayer::new_for_http())
+                .layer(TraceLayer::new_for_http().make_span_with(PathOnlySpan))
                 // A panic in resvg/tiny-skia on malformed input becomes a 500
                 // for that request instead of taking the process down.
                 .layer(CatchPanicLayer::new())
@@ -66,6 +70,24 @@ pub fn build_router(state: AppState) -> Router {
                     request_timeout,
                 )),
         )
+}
+
+/// `DefaultMakeSpan` records the whole request URI, which on `/link-preview`
+/// carries the third-party URL in `?url=`. We commit to not logging those, so
+/// the span is built from the path alone. Nothing else here has a query worth
+/// keeping — `/og/{id}?v=` is a content hash the log cannot use.
+#[derive(Clone, Copy)]
+struct PathOnlySpan;
+
+impl<B> tower_http::trace::MakeSpan<B> for PathOnlySpan {
+    fn make_span(&mut self, request: &Request<B>) -> tracing::Span {
+        tracing::debug_span!(
+            "request",
+            method = %request.method(),
+            path = %request.uri().path(),
+            version = ?request.version(),
+        )
+    }
 }
 
 /// Kubernetes sends SIGTERM, not SIGINT. Handling only ctrl_c meant the pod

@@ -23,6 +23,14 @@ the SPA's generic card rather than breaking anything.
   Registered under `/S/` too: the QR payload is uppercase, and nginx proxies the
   URI unchanged.
 - `GET /og/{id}.png?v={hash}` → 1200×630 PNG card.
+- `GET /link-preview?url={absolute http(s) url}` → JSON `{code, message, data}`
+  describing **someone else's** page: the inverse direction from the routes
+  above, which are about ours. The URL is attacker-controlled, so every hop is
+  address-checked, redirects are followed by hand and capped at 3, and the body
+  is capped while it streams. A page over the cap is truncated, not refused —
+  the metadata is in `<head>`. Non-`http(s)` or reserved addresses are 400,
+  non-HTML is 415, an upstream that fails or times out is 502 / 504. The `url`
+  is never logged.
 - `GET /healthz` → JSON with the loaded font family and face count.
 
 ## The card
@@ -122,6 +130,9 @@ container; the caches are in-memory, so restarting is what resets them.
 | `AVATAR_TIMEOUT_SECS` | `5` | avatar image fetch |
 | `AVATAR_MAX_BYTES` | `5242880` (5 MB) | body cap before decode |
 | `REQUEST_DEADLINE_SECS` | `4` | whole-request budget |
+| `LINK_PREVIEW_TIMEOUT_SECS` | `3` | per redirect hop |
+| `LINK_PREVIEW_DEADLINE_SECS` | `5` | whole link-preview budget; must fit the router's |
+| `LINK_PREVIEW_MAX_BYTES` | `512000` | body cap; over this the page is truncated |
 | `RENDER_EPOCH` | crate version | salt for `?v=`; bump to force re-render |
 | `MAX_CONCURRENT_RENDERS` | `32` | in-flight card renders; queues past this |
 | `ASSETS_DIR` | `assets` | bundled fonts |

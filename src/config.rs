@@ -41,6 +41,21 @@ pub struct Config {
     /// this to something that moves per deploy (the image tag) makes a visual
     /// change propagate. Defaults to the crate version.
     pub render_epoch: String,
+    /// Per-hop timeout for a link-preview fetch. A page that has not answered
+    /// in this long is not worth a card.
+    pub link_preview_timeout_secs: u64,
+    /// Whole-request budget for a link preview, spanning every redirect hop.
+    /// Must fit inside `router_timeout_secs`.
+    pub link_preview_deadline_secs: u64,
+    /// Hard cap on a previewed page body. The metadata lives in `<head>`, so
+    /// this is generous rather than tight.
+    pub link_preview_max_bytes: u64,
+    /// Test seam, deliberately not configuration. `from_env` pins it false and
+    /// no environment variable reaches it, so no deployment can turn the
+    /// address guard off; integration tests set it by building `Config`
+    /// in-process to reach a loopback stub. Loopback only — every other
+    /// reserved range stays refused either way.
+    pub allow_loopback_preview_targets: bool,
     /// Directory with the bundled fonts.
     pub assets_dir: String,
     /// Must match a family in `assets_dir`. Not inferred from load order.
@@ -86,9 +101,23 @@ impl Config {
             avatar_max_bytes: parse("AVATAR_MAX_BYTES", 5 * 1024 * 1024),
             max_concurrent_renders: parse("MAX_CONCURRENT_RENDERS", 8),
             render_epoch: var("RENDER_EPOCH", env!("CARGO_PKG_VERSION")),
+            link_preview_timeout_secs: parse("LINK_PREVIEW_TIMEOUT_SECS", 3),
+            link_preview_deadline_secs: parse("LINK_PREVIEW_DEADLINE_SECS", 5),
+            link_preview_max_bytes: parse("LINK_PREVIEW_MAX_BYTES", 512_000),
+            allow_loopback_preview_targets: false,
             assets_dir: var("ASSETS_DIR", "assets"),
             font_family: var("FONT_FAMILY", "Figtree"),
         }
+    }
+
+    /// The router's whole-request budget. Card assembly and the avatar fetch
+    /// are sequential and separately bounded, so it has to cover both or the
+    /// timeout layer 504s a render that was going to succeed.
+    ///
+    /// Lives here rather than inline in `build_router` so the config tests can
+    /// assert other deadlines fit inside it without restating the formula.
+    pub fn router_timeout_secs(&self) -> u64 {
+        self.request_deadline_secs + self.avatar_timeout_secs + 2
     }
 }
 
@@ -110,5 +139,12 @@ mod tests {
         assert!(c.provisional_ttl_secs <= c.cache_ttl_secs);
         // The per-call timeout has to fit inside the whole-request budget.
         assert!(c.fetch_timeout_secs <= c.request_deadline_secs);
+        // Same for a link preview: per hop inside the request deadline, and
+        // that deadline inside the router's, or the 504 comes from the timeout
+        // layer with no Cache-Control instead of from the endpoint.
+        assert!(c.link_preview_timeout_secs <= c.link_preview_deadline_secs);
+        assert!(c.link_preview_deadline_secs < c.router_timeout_secs());
+        // Nothing in the environment may relax the address guard.
+        assert!(!c.allow_loopback_preview_targets);
     }
 }
