@@ -215,8 +215,12 @@ async fn follow_and_read(st: &AppState, raw: &str) -> Result<Page, PreviewError>
     // 661 KB, and CNN's `og:title` at 310 KB with `</head>` at 2.4 MB. Failing
     // at the cap would drop both.
     //
-    // 310 KB is the worst offset measured, so 512 KB clears it by 1.6x — not
-    // by an order of magnitude. Do not lower this cap without re-measuring.
+    // The cap is sized from that: over 48 sites, recovering every available
+    // field needs a median of 1.5 KB and a p95 of 28 KB, with two outliers —
+    // CNN at 310 KB and YouTube at 705 KB. 512 KB is the smallest round value
+    // that keeps CNN; 256 KB would lose it. Raising to 1 MB buys back only
+    // YouTube, which never arrives here because the UI has a bespoke branch
+    // for it. Don't move this without re-measuring.
     //
     // So there is deliberately no `content_length()` pre-check, which the PRD
     // asked for: refusing an honestly-declared 654 KB while happily truncating
