@@ -19,8 +19,37 @@ pub async fn healthz(State(st): State<AppState>) -> Response {
         "version": env!("CARGO_PKG_VERSION"),
         "font_family": st.config.font_family,
         "faces": st.fontdb.len(),
+        // Every memory figure for this service was previously arithmetic. moka
+        // hands these over for free, so what the caches actually hold is a
+        // fact rather than an estimate.
+        "caches": {
+            "card": cache_stats(&st.card_cache),
+            "short_code": cache_stats(&st.short_code_cache),
+            "png": cache_stats(&st.png_cache),
+            "preview_rate": cache_stats(&st.preview_rate),
+            "link_preview": cache_stats(&st.link_preview_cache),
+        },
     });
     (StatusCode::OK, axum::Json(body)).into_response()
+}
+
+/// Both figures moka keeps, per cache.
+///
+/// `run_pending_tasks()` is deliberately not called: it would make these exact
+/// at the cost of doing the cache's housekeeping inline, and this endpoint is
+/// on a readiness probe. Approximate and cheap is the right trade — these are
+/// for capacity review, not accounting. A cache with no weigher weighs every
+/// entry as 1, so `weighted_size` there is the entry count by another name.
+fn cache_stats<K, V, S>(cache: &moka::future::Cache<K, V, S>) -> serde_json::Value
+where
+    K: std::hash::Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: std::hash::BuildHasher + Clone + Send + Sync + 'static,
+{
+    serde_json::json!({
+        "entry_count": cache.entry_count(),
+        "weighted_size": cache.weighted_size(),
+    })
 }
 
 /// Meta tags for crawlers. `/p/{id}` (canonical) and `/profile/{id}` (legacy).

@@ -15,6 +15,7 @@
 //! stops at "we have the bytes". `rate_limit` keeps the whole thing from being
 //! an open fetch proxy.
 
+pub mod cache;
 pub mod parse;
 pub mod rate_limit;
 
@@ -27,6 +28,7 @@ use serde::Deserialize;
 use std::time::Duration;
 use url::Url;
 
+use crate::link_preview::cache::Outcome;
 use crate::net::{self, Reserved};
 use crate::state::AppState;
 
@@ -57,9 +59,6 @@ const HEAD_FLOOR: usize = 8 * 1024;
 /// canonical) and few enough that a chain cannot be a work amplifier.
 const MAX_HOPS: u8 = 3;
 
-/// What the browser may hold. Ticket 05 ties this to the response cache's TTL;
-/// they are the same duration for the same reason.
-const OK_CACHE: &str = "public, max-age=86400";
 /// A rejected URL is rejected forever, so caches may absorb the retry.
 const REFUSED_CACHE: &str = "public, max-age=3600";
 /// An upstream failure is a fact about right now.
@@ -146,16 +145,33 @@ pub async fn link_preview(State(st): State<AppState>, Query(q): Query<PreviewQue
     let Some(raw) = q.url.filter(|u| !u.is_empty()) else {
         return refused(PreviewError::Refused("no url parameter"));
     };
+    // A URL that will not parse never reaches the cache: it costs nothing to
+    // reject and would otherwise be an entry per typo.
+    let Some(target) = cache::normalise(&raw) else {
+        return refused(PreviewError::Refused("unparseable url"));
+    };
 
-    match fetch(&st, &raw).await {
-        // A 200 with nulls is a real answer: a page with no usable markup
-        // degrades the card rather than erroring.
-        Ok(page) => {
-            let preview = parse::preview(&page, reserved_policy(&st));
+    let loader = st.clone();
+    let outcome = st
+        .link_preview_cache
+        .get_with(target.to_string(), async move {
+            match fetch_url(&loader, target).await {
+                // A 200 with nulls is a real answer: a page with no usable
+                // markup degrades the card rather than erroring.
+                Ok(page) => Outcome::Ok(parse::preview(&page, reserved_policy(&loader))),
+                Err(e) => Outcome::Failed(e),
+            }
+        })
+        .await;
+
+    match outcome {
+        Outcome::Ok(preview) => {
             let data = serde_json::to_value(preview).expect("Preview is plain data");
-            envelope(StatusCode::OK, None, OK_CACHE, data)
+            // The browser and nginx hold it for exactly as long as we do.
+            let cache = format!("public, max-age={}", st.config.link_preview_cache_ttl_secs);
+            envelope(StatusCode::OK, None, &cache, data)
         }
-        Err(e) => refused(e),
+        Outcome::Failed(e) => refused(e),
     }
 }
 
@@ -168,18 +184,25 @@ fn refused(e: PreviewError) -> Response {
 /// Fetch a third-party page, or say why not. Public so a test can parse what
 /// it returns without going back through the router.
 pub async fn fetch(st: &AppState, raw: &str) -> Result<Page, PreviewError> {
+    let target = cache::normalise(raw).ok_or(PreviewError::Refused("unparseable url"))?;
+    fetch_url(st, target).await
+}
+
+/// The fetch proper. The handler already has a parsed URL — it normalised one
+/// to build the cache key — so handing a string back would be re-parsing.
+async fn fetch_url(st: &AppState, target: Url) -> Result<Page, PreviewError> {
     let deadline = Duration::from_secs(st.config.link_preview_deadline_secs);
     // Bounds the whole chain, not each hop: three hops that each answer just
     // inside the per-hop timeout would otherwise sit well past it.
-    tokio::time::timeout(deadline, follow_and_read(st, raw))
+    tokio::time::timeout(deadline, follow_and_read(st, target))
         .await
         .unwrap_or(Err(PreviewError::Timeout))
 }
 
-async fn follow_and_read(st: &AppState, raw: &str) -> Result<Page, PreviewError> {
+async fn follow_and_read(st: &AppState, target: Url) -> Result<Page, PreviewError> {
     let max = st.config.link_preview_max_bytes;
     let per_hop = Duration::from_secs(st.config.link_preview_timeout_secs);
-    let mut target = validate(st, raw).await?;
+    let mut target = validate(st, target.as_str()).await?;
 
     // Redirects are followed here rather than by reqwest, which is configured
     // not to: its policy runs before we can re-check the destination, so an
@@ -346,7 +369,7 @@ fn classify(e: reqwest::Error) -> PreviewError {
 fn envelope(
     status: StatusCode,
     message: Option<&str>,
-    cache: &'static str,
+    cache: &str,
     data: serde_json::Value,
 ) -> Response {
     let body = serde_json::json!({
@@ -355,7 +378,9 @@ fn envelope(
         "data": data,
     });
     let mut headers = HeaderMap::new();
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
+    if let Ok(v) = HeaderValue::from_str(cache) {
+        headers.insert(header::CACHE_CONTROL, v);
+    }
     (status, headers, axum::Json(body)).into_response()
 }
 

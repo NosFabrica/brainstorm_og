@@ -29,6 +29,8 @@ pub struct AppState {
     /// Fixed-window rate-limit counters for `/link-preview`, keyed by tier and
     /// client IP. Entries expire with the window.
     pub preview_rate: Cache<String, Arc<AtomicU64>>,
+    /// Parsed previews, keyed by normalised URL.
+    pub link_preview_cache: crate::link_preview::cache::PreviewCache,
 }
 
 impl AppState {
@@ -108,6 +110,10 @@ impl AppState {
         let preview_rate = crate::link_preview::rate_limit::buckets(Duration::from_secs(
             config.link_preview_rate_window_secs,
         ));
+        let link_preview_cache = crate::link_preview::cache::store(
+            config.link_preview_cache_max_bytes,
+            Duration::from_secs(config.link_preview_cache_ttl_secs),
+        );
 
         Ok(Self {
             config: Arc::new(config),
@@ -119,6 +125,7 @@ impl AppState {
             short_code_cache,
             png_cache,
             preview_rate,
+            link_preview_cache,
         })
     }
 }

@@ -41,7 +41,16 @@ the SPA's generic card rather than breaking anything.
   origin is `APP_BASE_URL`), 20 for everything else, over which it is a 429. The
   address is read from `X-Forwarded-For` counting `TRUSTED_PROXY_HOPS` back from
   the **right**, so the entry the caller sent is never the one we key on.
-- `GET /healthz` → JSON with the loaded font family and face count.
+  Results are cached for a day (failures for five minutes) keyed on a
+  normalised URL — lowercased scheme and host, no fragment, and `utm_*`,
+  `fbclid`, `gclid`, `msclkid`, `igshid` stripped from both the key and the
+  request we send; `ref` is left alone. Loaded through a single flight, so a
+  burst of viewers of one note is one outbound fetch. A successful response
+  carries the same `max-age`, so the browser and nginx cache it too.
+- `GET /healthz` → JSON with the loaded font family and face count, plus
+  `entry_count` and `weighted_size` per cache. Cheap enough for a readiness
+  probe: moka's own figures, read without forcing its housekeeping, so they lag
+  slightly rather than costing anything.
 
 ## The card
 
@@ -143,6 +152,8 @@ container; the caches are in-memory, so restarting is what resets them.
 | `LINK_PREVIEW_TIMEOUT_SECS` | `3` | per redirect hop |
 | `LINK_PREVIEW_DEADLINE_SECS` | `5` | whole link-preview budget; must fit the router's |
 | `LINK_PREVIEW_MAX_BYTES` | `512000` | body cap; over this the page is truncated |
+| `LINK_PREVIEW_CACHE_TTL_SECS` | `86400` | preview TTL, and the response `max-age` |
+| `LINK_PREVIEW_CACHE_MAX_BYTES` | `16777216` (16 MB) | preview cache cap, weighed on key + value |
 | `LINK_PREVIEW_RATE_TRUSTED` | `600` | previews per window from our own SPA |
 | `LINK_PREVIEW_RATE_UNTRUSTED` | `20` | previews per window from everything else |
 | `LINK_PREVIEW_RATE_WINDOW_SECS` | `60` | the window both rates are counted over |

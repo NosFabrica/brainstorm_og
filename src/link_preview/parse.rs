@@ -66,6 +66,21 @@ pub struct Preview {
     pub url: String,
 }
 
+impl Preview {
+    /// Heap bytes this holds, for the cache's weigher. Field caps are in
+    /// *characters*, not bytes, so a CJK-heavy preview is roughly three times
+    /// a Latin one at the same cap — which is exactly why this counts the
+    /// strings rather than assuming a per-entry average.
+    pub(crate) fn byte_size(&self) -> usize {
+        [&self.title, &self.description, &self.image, &self.site_name]
+            .into_iter()
+            .flatten()
+            .map(String::len)
+            .sum::<usize>()
+            + self.url.len()
+    }
+}
+
 /// Raw candidates, keyed as the markup named them.
 #[derive(Debug, Default)]
 struct Tags {

@@ -40,6 +40,8 @@ fn router() -> axum::Router {
         link_preview_deadline_secs: 2,
         link_preview_max_bytes: 64 * 1024,
         max_concurrent_previews: 4,
+        link_preview_cache_ttl_secs: 86_400,
+        link_preview_cache_max_bytes: 1024 * 1024,
         // Both tiers set alike and high: nothing in this file is about the
         // limiter, and tests/rate_limit.rs is.
         link_preview_rate_trusted: 600,

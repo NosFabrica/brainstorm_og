@@ -53,6 +53,13 @@ pub struct Config {
     /// In-flight link-preview fetches. Route-scoped, for the reason
     /// `build_router` gives.
     pub max_concurrent_previews: usize,
+    /// How long a parsed preview is held, and the `max-age` the response
+    /// advertises — the browser and nginx cache for exactly as long as we do.
+    pub link_preview_cache_ttl_secs: u64,
+    /// Ceiling on the preview cache, in bytes. Byte-bounded rather than
+    /// entry-bounded because entry size varies by an order of magnitude, and
+    /// the figure that has to fit the pod's memory limit is bytes.
+    pub link_preview_cache_max_bytes: u64,
     /// Requests per window from traffic our own SPA originated. High enough
     /// that a real user never meets it.
     pub link_preview_rate_trusted: u32,
@@ -120,6 +127,8 @@ impl Config {
             link_preview_deadline_secs: parse("LINK_PREVIEW_DEADLINE_SECS", 5),
             link_preview_max_bytes: parse("LINK_PREVIEW_MAX_BYTES", 512_000),
             max_concurrent_previews: parse("MAX_CONCURRENT_PREVIEWS", 16),
+            link_preview_cache_ttl_secs: parse("LINK_PREVIEW_CACHE_TTL_SECS", 86_400),
+            link_preview_cache_max_bytes: parse("LINK_PREVIEW_CACHE_MAX_BYTES", 16 * 1024 * 1024),
             link_preview_rate_trusted: parse("LINK_PREVIEW_RATE_TRUSTED", 600),
             link_preview_rate_untrusted: parse("LINK_PREVIEW_RATE_UNTRUSTED", 20),
             link_preview_rate_window_secs: parse("LINK_PREVIEW_RATE_WINDOW_SECS", 60),
