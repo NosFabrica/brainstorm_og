@@ -1,6 +1,12 @@
 //! Validates outbound URLs built from attacker-controlled input (kind-0
-//! `picture`). Pre-connect only, so DNS rebinding is unmitigated — see the
-//! accepted-risk note in CONTEXT.md.
+//! `picture`, and the `?url=` a link preview is asked for).
+//!
+//! The checks here are pre-connect, so on their own they leave a rebinding
+//! window between check and socket. `resolver` closes it for the link-preview
+//! client by applying the same address policy at resolution time; the avatar
+//! path is still pre-connect only — see the accepted-risk note in CONTEXT.md.
+
+pub mod resolver;
 
 use anyhow::{bail, Result};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};

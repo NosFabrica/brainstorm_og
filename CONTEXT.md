@@ -113,10 +113,32 @@ idles, an unresolvable upstream falls back to the SPA — but both are needed fo
 unfurls to work and **neither reports the other missing**, because "og is
 absent" and "og is misconfigured" are the same observable.
 
+### The link-preview client filters addresses at DNS resolution
+
+Not only before the connection. A pre-connect check leaves a window in which
+the name re-answers with an internal address, and the socket opens on the one
+nobody judged. The fetching client resolves through `net::resolver`, which
+applies the same address policy to the resolver's answer — and that answer is
+what the connector dials, so there is no second, unchecked resolution.
+
+The pre-connect `validate_and_resolve` stays. It is what turns a refused URL
+into a 400 the caller can cache, and it judges IP-literal hosts, which never
+reach the resolver at all — the connector parses those itself.
+
+A whole answer is rejected when any address in it is reserved, rather than
+trimmed to the survivors. A name handing back one internal address is not one
+we want to reach at its other one, and it keeps the two checks agreeing.
+
 ## Accepted risk
 
-Avatar-URL validation is in-process and pre-connect, so DNS rebinding between
-check and socket is unmitigated. The cluster runs flannel, which does not
-implement NetworkPolicy — an egress policy would apply cleanly and enforce
-nothing, which is worse than none. Accepted because the fetched body is decoded
-and never echoed: blind SSRF at worst, no exfiltration path.
+Avatar-URL validation is in-process and **pre-connect only**, so DNS rebinding
+between check and socket is unmitigated on that path. The cluster runs flannel,
+which does not implement NetworkPolicy — an egress policy would apply cleanly
+and enforce nothing, which is worse than none. Accepted because the fetched
+body is decoded and never echoed: blind SSRF at worst, no exfiltration path.
+
+That reasoning does **not** extend to `/link-preview`, which echoes parsed
+content back to the caller and so would turn the same window into a read
+primitive. It is closed there by the resolver above rather than accepted.
+Giving `avatar_http` the same resolver is worth doing and deliberately has not
+been done yet; until it is, the note above is the whole of the argument.

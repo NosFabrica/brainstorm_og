@@ -19,7 +19,9 @@ pub struct AppState {
     /// pre-connect address check.
     pub avatar_http: reqwest::Client,
     /// Third-party pages named in notes. Same no-redirect reasoning as
-    /// `avatar_http`, plus an honest bot identity we never disguise.
+    /// `avatar_http`, plus an honest bot identity we never disguise — and,
+    /// unlike `avatar_http`, a resolver that refuses reserved addresses at
+    /// resolution time rather than only before the connection.
     pub preview_http: reqwest::Client,
     pub fontdb: Arc<fontdb::Database>,
     pub card_cache: Cache<String, Card>,
@@ -83,6 +85,7 @@ impl AppState {
         let preview_http = reqwest::Client::builder()
             .user_agent(crate::link_preview::USER_AGENT)
             .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(crate::net::resolver::system(config.reserved_policy()))
             .build()
             .context("building link preview client")?;
 

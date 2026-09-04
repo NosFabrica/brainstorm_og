@@ -142,6 +142,21 @@ impl Config {
         }
     }
 
+    /// Whether reserved addresses are refused when previewing a link. Three
+    /// things read it: the pre-connect check, the resolver the fetching client
+    /// dials through, and `parse` — which judges `og:image` by the same ranges,
+    /// so an address we would not dial is not one we hand the browser.
+    ///
+    /// Here rather than in `link_preview` because `AppState::new` needs it to
+    /// build that client, before there is a state to ask.
+    pub fn reserved_policy(&self) -> crate::net::Reserved {
+        if self.allow_loopback_preview_targets {
+            crate::net::Reserved::AllowLoopback
+        } else {
+            crate::net::Reserved::Refuse
+        }
+    }
+
     /// The router's whole-request budget. Card assembly and the avatar fetch
     /// are sequential and separately bounded, so it has to cover both or the
     /// timeout layer 504s a render that was going to succeed.

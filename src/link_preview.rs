@@ -29,7 +29,7 @@ use std::time::Duration;
 use url::Url;
 
 use crate::link_preview::cache::Outcome;
-use crate::net::{self, Reserved};
+use crate::net;
 use crate::state::AppState;
 
 /// Honest, resolvable, and never another company's preview bot. The measured
@@ -158,7 +158,7 @@ pub async fn link_preview(State(st): State<AppState>, Query(q): Query<PreviewQue
             match fetch_url(&loader, target).await {
                 // A 200 with nulls is a real answer: a page with no usable
                 // markup degrades the card rather than erroring.
-                Ok(page) => Outcome::Ok(parse::preview(&page, reserved_policy(&loader))),
+                Ok(page) => Outcome::Ok(parse::preview(&page, loader.config.reserved_policy())),
                 Err(e) => Outcome::Failed(e),
             }
         })
@@ -321,18 +321,8 @@ fn find_head_end(hay: &[u8], from: usize) -> Option<usize> {
         .map(|i| from + i + HEAD_TAG.len())
 }
 
-/// The address policy for this deployment. `parse` judges `og:image` by the
-/// same ranges, so an address we would not dial is not one we hand the browser.
-pub(crate) fn reserved_policy(st: &AppState) -> Reserved {
-    if st.config.allow_loopback_preview_targets {
-        Reserved::AllowLoopback
-    } else {
-        Reserved::Refuse
-    }
-}
-
 async fn validate(st: &AppState, raw: &str) -> Result<Url, PreviewError> {
-    net::validate_and_resolve_with(raw, SCHEMES, reserved_policy(st))
+    net::validate_and_resolve_with(raw, SCHEMES, st.config.reserved_policy())
         .await
         // The error names the host it refused, which is the one thing that may
         // not be logged. Only the fact survives.
