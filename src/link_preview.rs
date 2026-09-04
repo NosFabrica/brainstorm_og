@@ -11,8 +11,10 @@
 //! is judged too, and the body is capped while it streams rather than after it
 //! has been buffered.
 //!
-//! This module stops at "we have the bytes". Parsing them into card fields is
-//! ticket 03; `data` is null until then.
+//! `parse` turns those bytes into the four fields a card needs; this file
+//! stops at "we have the bytes".
+
+pub mod parse;
 
 use axum::{
     extract::{Query, State},
@@ -31,7 +33,9 @@ use crate::state::AppState;
 /// `$is_og_bot` regex, so our own `/p/` links preview correctly.
 pub const USER_AGENT: &str = "BrainstormBot/1.0 (+https://brainstorm.world/bot)";
 
-const SCHEMES: &[&str] = &["http", "https"];
+/// The only schemes we dial — and, in `parse`, the only ones we will hand a
+/// browser to load.
+pub(crate) const SCHEMES: &[&str] = &["http", "https"];
 
 /// We stop reading once `<head>` has closed — everything a preview needs is
 /// inside it, and the rest is bytes nobody looks at. Measured over 48 sites,
@@ -68,7 +72,7 @@ pub struct PreviewQuery {
 
 /// A fetched page, before anything has been read out of it.
 pub struct Page {
-    /// After redirects. Ticket 03 resolves relative `og:image` against this.
+    /// After redirects. `parse` resolves a relative `og:image` against this.
     pub final_url: Url,
     pub content_type: String,
     /// Normally everything up to `</head>`; at most `LINK_PREVIEW_MAX_BYTES`.
@@ -142,9 +146,13 @@ pub async fn link_preview(State(st): State<AppState>, Query(q): Query<PreviewQue
     };
 
     match fetch(&st, &raw).await {
-        // Ticket 03 fills `data` in. A 200 with nulls is a real answer: a page
-        // with no usable markup degrades the card rather than erroring.
-        Ok(_page) => envelope(StatusCode::OK, None, OK_CACHE),
+        // A 200 with nulls is a real answer: a page with no usable markup
+        // degrades the card rather than erroring.
+        Ok(page) => {
+            let preview = parse::preview(&page, reserved_policy(&st));
+            let data = serde_json::to_value(preview).expect("Preview is plain data");
+            envelope(StatusCode::OK, None, OK_CACHE, data)
+        }
         Err(e) => refused(e),
     }
 }
@@ -152,11 +160,11 @@ pub async fn link_preview(State(st): State<AppState>, Query(q): Query<PreviewQue
 fn refused(e: PreviewError) -> Response {
     tracing::debug!(reason = e.reason(), "link preview failed");
     let (status, message, cache) = e.parts();
-    envelope(status, Some(message), cache)
+    envelope(status, Some(message), cache, serde_json::Value::Null)
 }
 
-/// Fetch a third-party page, or say why not. Public so ticket 03 can parse
-/// what it returns without going back through the router.
+/// Fetch a third-party page, or say why not. Public so a test can parse what
+/// it returns without going back through the router.
 pub async fn fetch(st: &AppState, raw: &str) -> Result<Page, PreviewError> {
     let deadline = Duration::from_secs(st.config.link_preview_deadline_secs);
     // Bounds the whole chain, not each hop: three hops that each answer just
@@ -288,20 +296,25 @@ fn find_head_end(hay: &[u8], from: usize) -> Option<usize> {
         .map(|i| from + i + HEAD_TAG.len())
 }
 
-async fn validate(st: &AppState, raw: &str) -> Result<Url, PreviewError> {
-    let reserved = if st.config.allow_loopback_preview_targets {
+/// The address policy for this deployment. `parse` judges `og:image` by the
+/// same ranges, so an address we would not dial is not one we hand the browser.
+pub(crate) fn reserved_policy(st: &AppState) -> Reserved {
+    if st.config.allow_loopback_preview_targets {
         Reserved::AllowLoopback
     } else {
         Reserved::Refuse
-    };
-    net::validate_and_resolve_with(raw, SCHEMES, reserved)
+    }
+}
+
+async fn validate(st: &AppState, raw: &str) -> Result<Url, PreviewError> {
+    net::validate_and_resolve_with(raw, SCHEMES, reserved_policy(st))
         .await
         // The error names the host it refused, which is the one thing that may
         // not be logged. Only the fact survives.
         .map_err(|_| PreviewError::Refused("url refused by address validation"))
 }
 
-/// Ticket 03 needs `<head>` markup; anything else is not worth the bytes. A
+/// `parse` needs `<head>` markup; anything else is not worth the bytes. A
 /// missing type is refused too — guessing is how you end up parsing a PDF.
 fn is_html(content_type: &str) -> bool {
     let essence = content_type
@@ -328,11 +341,16 @@ fn classify(e: reqwest::Error) -> PreviewError {
 }
 
 /// The wrapped `{code, message, data}` shape the UI already expects.
-fn envelope(status: StatusCode, message: Option<&str>, cache: &'static str) -> Response {
+fn envelope(
+    status: StatusCode,
+    message: Option<&str>,
+    cache: &'static str,
+    data: serde_json::Value,
+) -> Response {
     let body = serde_json::json!({
         "code": status.as_u16(),
         "message": message,
-        "data": serde_json::Value::Null,
+        "data": data,
     });
     let mut headers = HeaderMap::new();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));

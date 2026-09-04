@@ -6,7 +6,8 @@
 //! the stub server these tests need. `allow_loopback_preview_targets` is the
 //! seam that lets a test point at loopback; no environment variable reaches it.
 //!
-//! Issue: .scratch/link-preview/issues/02-link-preview-route-safe-fetch.md
+//! Issues: .scratch/link-preview/issues/02-link-preview-route-safe-fetch.md,
+//!         .scratch/link-preview/issues/03-parse-opengraph-fields.md
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
@@ -20,7 +21,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tower::ServiceExt;
 
-const HTML: &str = "<!doctype html><html><head><title>Stub</title></head><body>hi</body></html>";
+const HTML: &str = "<!doctype html><html><head>\
+    <title>Stub &amp; co</title>\
+    <meta property=\"og:title\" content=\"Stub Title\">\
+    <meta property=\"og:description\" content=\"Stub description.\">\
+    <meta property=\"og:image\" content=\"https://cdn.example/card.png\">\
+    <meta property=\"og:site_name\" content=\"Stub Site\">\
+    </head><body>hi</body></html>";
+
+/// No `og:`, no `twitter:`, no `<title>` — the common case, per the PRD's
+/// measurements. Must be a 200 with nulls, not an error.
+const BARE_HTML: &str = "<!doctype html><html><head></head><body>hi</body></html>";
 
 /// Chunks `/big` will emit if nothing stops it. Far past any cap a test sets,
 /// so "we stopped early" is observable rather than inferred.
@@ -49,6 +60,23 @@ async fn stub_site() -> Stub {
             get(|| async { ([(header::CONTENT_TYPE, "text/plain")], "not a document") }),
         )
         .route("/no-type", get(|| async { HTML.to_string() }))
+        .route(
+            "/bare",
+            get(|| async { ([(header::CONTENT_TYPE, "text/html")], BARE_HTML) }),
+        )
+        // A relative `og:image`, reached via a redirect, so the only URL that
+        // resolves it correctly is the final one.
+        .route("/moved", get(|| async { redirect("/deep/story") }))
+        .route(
+            "/deep/story",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/html")],
+                    "<html><head><meta property='og:title'\n content='Moved'>\
+                     <meta property=\"og:image\" content=\"card.png\"></head>",
+                )
+            }),
+        )
         .route(
             "/declared-big",
             get(|| async {
@@ -293,15 +321,53 @@ async fn a_page_with_no_head_still_stops_at_the_cap() {
 }
 
 #[tokio::test]
-async fn a_fetchable_html_page_is_a_200_envelope() {
+async fn a_fetchable_html_page_yields_its_metadata() {
     let stub = stub_site().await;
     let res = preview(&format!("{}/full", stub.base)).await;
 
     assert_eq!(res.status, StatusCode::OK);
     assert_eq!(res.body["code"], 200);
-    // Parsing is ticket 03; this ticket stops at "we have the bytes".
-    assert!(res.body["data"].is_null(), "got {}", res.body);
     assert_eq!(res.cache, "public, max-age=86400");
+
+    let data = &res.body["data"];
+    assert_eq!(data["title"], "Stub Title");
+    assert_eq!(data["description"], "Stub description.");
+    assert_eq!(data["image"], "https://cdn.example/card.png");
+    assert_eq!(data["siteName"], "Stub Site");
+    assert_eq!(data["url"], format!("{}/full", stub.base));
+}
+
+#[tokio::test]
+async fn a_page_with_no_markup_is_a_200_with_nulls() {
+    // The card degrades rather than disappearing, and the answer is cacheable
+    // for as long as a successful one — "this page has nothing" is a result.
+    let stub = stub_site().await;
+    let res = preview(&format!("{}/bare", stub.base)).await;
+
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.cache, "public, max-age=86400");
+
+    let data = &res.body["data"];
+    assert!(data["title"].is_null(), "got {data}");
+    assert!(data["description"].is_null(), "got {data}");
+    assert!(data["image"].is_null(), "got {data}");
+    // The host stands in for a missing `og:site_name`.
+    assert!(data["siteName"].is_string(), "got {data}");
+}
+
+#[tokio::test]
+async fn the_image_resolves_against_the_url_after_redirects() {
+    let stub = stub_site().await;
+    let res = preview(&format!("{}/moved", stub.base)).await;
+
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["data"]["title"], "Moved");
+    assert_eq!(
+        res.body["data"]["image"],
+        format!("{}/deep/card.png", stub.base),
+        "resolved against the requested URL rather than the final one"
+    );
+    assert_eq!(res.body["data"]["url"], format!("{}/deep/story", stub.base));
 }
 
 #[tokio::test]

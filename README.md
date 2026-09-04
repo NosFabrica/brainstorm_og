@@ -32,7 +32,11 @@ the SPA's generic card rather than breaking anything.
   a third party by ~59%. A page whose head runs past the cap is truncated, not
   refused. Non-`http(s)` or reserved addresses are 400,
   non-HTML is 415, an upstream that fails or times out is 502 / 504. The `url`
-  is never logged.
+  is never logged. `data` carries `{title, description, image, siteName, url}`,
+  all nullable — `og:` first, then `twitter:` (X publishes nothing else), then
+  `<title>` / `meta[name=description]`. `image` resolves against the final URL
+  and is nulled unless it passes the same address check we dial by, since the
+  browser loads it on our say-so.
 - `GET /healthz` → JSON with the loaded font family and face count.
 
 ## The card
