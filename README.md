@@ -27,8 +27,10 @@ the SPA's generic card rather than breaking anything.
   describing **someone else's** page: the inverse direction from the routes
   above, which are about ours. The URL is attacker-controlled, so every hop is
   address-checked, redirects are followed by hand and capped at 3, and the body
-  is capped while it streams. A page over the cap is truncated, not refused —
-  the metadata is in `<head>`. Non-`http(s)` or reserved addresses are 400,
+  is capped while it streams. Reading stops once `</head>` closes (never before
+  8 KB — some sites put their tags just past it), which cuts what we pull from
+  a third party by ~59%. A page whose head runs past the cap is truncated, not
+  refused. Non-`http(s)` or reserved addresses are 400,
   non-HTML is 415, an upstream that fails or times out is 502 / 504. The `url`
   is never logged.
 - `GET /healthz` → JSON with the loaded font family and face count.

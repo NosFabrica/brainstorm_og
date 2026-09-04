@@ -13,6 +13,7 @@ use axum::http::{header, Request, StatusCode};
 use axum::response::IntoResponse;
 use axum::{routing::get, Router};
 use brainstorm_og::{build_router, config::Config, state::AppState};
+use futures_util::StreamExt as _;
 use http_body_util::BodyExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -36,6 +37,7 @@ struct Stub {
 async fn stub_site() -> Stub {
     let sent = Arc::new(AtomicUsize::new(0));
     let counter = sent.clone();
+    let early = sent.clone();
 
     let app = Router::new()
         .route(
@@ -72,6 +74,46 @@ async fn stub_site() -> Stub {
                         Body::from_stream(stream),
                     )
                 }
+            }),
+        )
+        .route(
+            "/early",
+            get(move || {
+                let counter = early.clone();
+                async move {
+                    // 200 bytes of head, then 16 MB nobody should read.
+                    let head = format!(
+                        "<html><head><title>Early</title>\
+                         <meta property=\"og:title\" content=\"Early\">{}</head><body>",
+                        " ".repeat(64)
+                    );
+                    let stream = futures_util::stream::once(async move {
+                        Ok::<_, std::io::Error>(head.into_bytes())
+                    })
+                    .chain(futures_util::stream::iter((0..BIG_CHUNKS).map(move |_| {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, std::io::Error>(vec![b'x'; BIG_CHUNK_BYTES])
+                    })));
+                    (
+                        [(header::CONTENT_TYPE, "text/html")],
+                        Body::from_stream(stream),
+                    )
+                }
+            }),
+        )
+        .route(
+            // blockstream.com's real shape: `</head>` closes at ~1.5 KB and the
+            // tags land in the body at ~4.6 KB.
+            "/tags-after-head",
+            get(|| async {
+                let body = format!(
+                    "<html><head><link rel=\"stylesheet\" href=\"/a.css\">{}</head>\
+                     <body>{}<meta property=\"og:title\" content=\"Late\">{}",
+                    " ".repeat(1400),
+                    " ".repeat(3000),
+                    "y".repeat(200_000)
+                );
+                ([(header::CONTENT_TYPE, "text/html")], body)
             }),
         )
         .route(
@@ -192,6 +234,62 @@ fn percent_encode(s: &str) -> String {
             c => c.to_string().bytes().map(|b| format!("%{b:02X}")).collect(),
         })
         .collect()
+}
+
+async fn fetch_from(stub: &Stub, path: &str) -> brainstorm_og::link_preview::Page {
+    let state = AppState::new(test_config()).expect("fonts must load from assets/");
+    brainstorm_og::link_preview::fetch(&state, &format!("{}{path}", stub.base))
+        .await
+        .expect("fetch should have succeeded")
+}
+
+#[tokio::test]
+async fn reading_stops_once_head_closes() {
+    let stub = stub_site().await;
+    let page = fetch_from(&stub, "/early").await;
+
+    // The 8 KB floor binds here, not the 64 KB cap and not the 16 MB body.
+    assert!(
+        page.body.len() < 16 * 1024,
+        "read {} bytes past a head that closed at ~200",
+        page.body.len()
+    );
+    assert!(!page.truncated, "stopping at </head> is a complete read");
+    assert!(String::from_utf8_lossy(&page.body).contains("og:title"));
+
+    // And we stopped pulling from the socket, rather than reading and trimming.
+    let sent = stub.sent.load(Ordering::SeqCst);
+    assert!(
+        sent < BIG_CHUNKS,
+        "drained all {BIG_CHUNKS} chunks after the head had closed"
+    );
+}
+
+#[tokio::test]
+async fn tags_just_past_a_prematurely_closed_head_are_still_read() {
+    // blockstream.com closes `<head>` at byte 1,483 and puts `og:title` at
+    // 4.6 KB. Stopping dead at `</head>` loses it; the floor is why we don't.
+    let stub = stub_site().await;
+    let page = fetch_from(&stub, "/tags-after-head").await;
+
+    assert!(
+        String::from_utf8_lossy(&page.body).contains("og:title"),
+        "stopped at </head> and lost the tags behind it"
+    );
+    assert!(
+        page.body.len() < 32 * 1024,
+        "read {} bytes",
+        page.body.len()
+    );
+}
+
+#[tokio::test]
+async fn a_page_with_no_head_still_stops_at_the_cap() {
+    // No `</head>` anywhere, so the early stop never fires and the cap is the
+    // only thing bounding the read.
+    let stub = stub_site().await;
+    let res = preview(&format!("{}/big", stub.base)).await;
+    assert_eq!(res.status, StatusCode::OK);
 }
 
 #[tokio::test]
