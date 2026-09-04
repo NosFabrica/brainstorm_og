@@ -23,6 +23,7 @@ pub const DEFAULT_LOG_FILTER: &str = "brainstorm_og=info,tower_http=warn";
 pub fn build_router(state: AppState) -> Router {
     let request_timeout = Duration::from_secs(state.config.router_timeout_secs());
     let max_renders = state.config.max_concurrent_renders;
+    let max_previews = state.config.max_concurrent_previews;
 
     Router::new()
         .route("/healthz", get(routes::healthz))
@@ -57,7 +58,20 @@ pub fn build_router(state: AppState) -> Router {
         )
         // A third-party page, fetched because a human opened a note that links
         // to it. The inverse of an unfurl — see CONTEXT.md.
-        .route("/link-preview", get(link_preview::link_preview))
+        //
+        // Both layers are route-scoped, for the reason `/og/{id}`'s is. The
+        // rate limiter is applied last and so runs first, which is what keeps
+        // an over-limit request from queueing for a fetch permit before being
+        // told no.
+        .route(
+            "/link-preview",
+            get(link_preview::link_preview)
+                .layer(ConcurrencyLimitLayer::new(max_previews))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    link_preview::rate_limit::enforce,
+                )),
+        )
         .with_state(state)
         .layer(
             ServiceBuilder::new()

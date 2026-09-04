@@ -39,6 +39,13 @@ fn router() -> axum::Router {
         link_preview_timeout_secs: 1,
         link_preview_deadline_secs: 2,
         link_preview_max_bytes: 64 * 1024,
+        max_concurrent_previews: 4,
+        // Both tiers set alike and high: nothing in this file is about the
+        // limiter, and tests/rate_limit.rs is.
+        link_preview_rate_trusted: 600,
+        link_preview_rate_untrusted: 600,
+        link_preview_rate_window_secs: 60,
+        trusted_proxy_hops: 2,
         allow_loopback_preview_targets: false,
     };
     build_router(AppState::new(config).expect("fonts must load from assets/"))

@@ -36,7 +36,11 @@ the SPA's generic card rather than breaking anything.
   all nullable — `og:` first, then `twitter:` (X publishes nothing else), then
   `<title>` / `meta[name=description]`. `image` resolves against the final URL
   and is nulled unless it passes the same address check we dial by, since the
-  browser loads it on our say-so.
+  browser loads it on our say-so. Rate limited per client IP, at two rates: 600
+  a minute for our own SPA (`Sec-Fetch-Site: same-origin`, or a `Referer` whose
+  origin is `APP_BASE_URL`), 20 for everything else, over which it is a 429. The
+  address is read from `X-Forwarded-For` counting `TRUSTED_PROXY_HOPS` back from
+  the **right**, so the entry the caller sent is never the one we key on.
 - `GET /healthz` → JSON with the loaded font family and face count.
 
 ## The card
@@ -139,6 +143,11 @@ container; the caches are in-memory, so restarting is what resets them.
 | `LINK_PREVIEW_TIMEOUT_SECS` | `3` | per redirect hop |
 | `LINK_PREVIEW_DEADLINE_SECS` | `5` | whole link-preview budget; must fit the router's |
 | `LINK_PREVIEW_MAX_BYTES` | `512000` | body cap; over this the page is truncated |
+| `LINK_PREVIEW_RATE_TRUSTED` | `600` | previews per window from our own SPA |
+| `LINK_PREVIEW_RATE_UNTRUSTED` | `20` | previews per window from everything else |
+| `LINK_PREVIEW_RATE_WINDOW_SECS` | `60` | the window both rates are counted over |
+| `TRUSTED_PROXY_HOPS` | `2` | entries back from the right of `X-Forwarded-For` |
+| `MAX_CONCURRENT_PREVIEWS` | `16` | in-flight link-preview fetches; queues past this |
 | `RENDER_EPOCH` | crate version | salt for `?v=`; bump to force re-render |
 | `MAX_CONCURRENT_RENDERS` | `32` | in-flight card renders; queues past this |
 | `ASSETS_DIR` | `assets` | bundled fonts |

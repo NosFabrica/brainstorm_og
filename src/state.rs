@@ -2,6 +2,7 @@ use anyhow::{bail, Context};
 use bytes::Bytes;
 use moka::future::Cache;
 use resvg::usvg::fontdb;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,6 +26,9 @@ pub struct AppState {
     /// Short code -> hex pubkey. Immutable once minted, so no TTL.
     pub short_code_cache: Cache<String, String>,
     pub png_cache: Cache<String, Bytes>,
+    /// Fixed-window rate-limit counters for `/link-preview`, keyed by tier and
+    /// client IP. Entries expire with the window.
+    pub preview_rate: Cache<String, Arc<AtomicU64>>,
 }
 
 impl AppState {
@@ -101,6 +105,10 @@ impl AppState {
             .time_to_live(ttl)
             .build();
 
+        let preview_rate = crate::link_preview::rate_limit::buckets(Duration::from_secs(
+            config.link_preview_rate_window_secs,
+        ));
+
         Ok(Self {
             config: Arc::new(config),
             http,
@@ -110,6 +118,7 @@ impl AppState {
             card_cache,
             short_code_cache,
             png_cache,
+            preview_rate,
         })
     }
 }

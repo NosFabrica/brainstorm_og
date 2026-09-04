@@ -50,6 +50,21 @@ pub struct Config {
     /// Hard cap on a previewed page body. The metadata lives in `<head>`, so
     /// this is generous rather than tight.
     pub link_preview_max_bytes: u64,
+    /// In-flight link-preview fetches. Route-scoped, for the reason
+    /// `build_router` gives.
+    pub max_concurrent_previews: usize,
+    /// Requests per window from traffic our own SPA originated. High enough
+    /// that a real user never meets it.
+    pub link_preview_rate_trusted: u32,
+    /// Requests per window from everything else.
+    pub link_preview_rate_untrusted: u32,
+    /// The fixed window both rates are counted over.
+    pub link_preview_rate_window_secs: u64,
+    /// How many entries to count back from the **right** of `X-Forwarded-For`
+    /// to find the address our own proxy wrote. Defaults to 2 — client ->
+    /// ingress -> the UI's nginx -> here. The leftmost entry is whatever the
+    /// client sent, so it is never read.
+    pub trusted_proxy_hops: usize,
     /// Test seam, deliberately not configuration. `from_env` pins it false and
     /// no environment variable reaches it, so no deployment can turn the
     /// address guard off; integration tests set it by building `Config`
@@ -104,6 +119,14 @@ impl Config {
             link_preview_timeout_secs: parse("LINK_PREVIEW_TIMEOUT_SECS", 3),
             link_preview_deadline_secs: parse("LINK_PREVIEW_DEADLINE_SECS", 5),
             link_preview_max_bytes: parse("LINK_PREVIEW_MAX_BYTES", 512_000),
+            max_concurrent_previews: parse("MAX_CONCURRENT_PREVIEWS", 16),
+            link_preview_rate_trusted: parse("LINK_PREVIEW_RATE_TRUSTED", 600),
+            link_preview_rate_untrusted: parse("LINK_PREVIEW_RATE_UNTRUSTED", 20),
+            link_preview_rate_window_secs: parse("LINK_PREVIEW_RATE_WINDOW_SECS", 60),
+            // Clamped, not just defaulted: 0 reads nothing and silently drops
+            // every caller into the shared peer bucket, which is the bug
+            // counting from the right exists to avoid.
+            trusted_proxy_hops: parse::<usize>("TRUSTED_PROXY_HOPS", 2).max(1),
             allow_loopback_preview_targets: false,
             assets_dir: var("ASSETS_DIR", "assets"),
             font_family: var("FONT_FAMILY", "Figtree"),
@@ -146,5 +169,13 @@ mod tests {
         assert!(c.link_preview_deadline_secs < c.router_timeout_secs());
         // Nothing in the environment may relax the address guard.
         assert!(!c.allow_loopback_preview_targets);
+        // The two tiers only mean something if one is a ceiling and the other
+        // a throttle; equal rates would make the Sec-Fetch-Site check dead code.
+        assert!(c.link_preview_rate_untrusted < c.link_preview_rate_trusted);
+        assert!(c.link_preview_rate_window_secs > 0);
+        // Counting back zero hops reads nothing and silently falls through to
+        // the shared peer address, which is the bug this whole scheme exists
+        // to avoid.
+        assert!(c.trusted_proxy_hops >= 1);
     }
 }

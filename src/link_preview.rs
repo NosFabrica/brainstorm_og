@@ -12,9 +12,11 @@
 //! has been buffered.
 //!
 //! `parse` turns those bytes into the four fields a card needs; this file
-//! stops at "we have the bytes".
+//! stops at "we have the bytes". `rate_limit` keeps the whole thing from being
+//! an open fetch proxy.
 
 pub mod parse;
+pub mod rate_limit;
 
 use axum::{
     extract::{Query, State},
