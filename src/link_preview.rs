@@ -209,10 +209,14 @@ async fn follow_and_read(st: &AppState, raw: &str) -> Result<Page, PreviewError>
     // measuring afterwards — `bytes()` would do exactly that, whatever
     // Content-Length claimed.
     //
-    // Over-cap truncates rather than failing: everything a preview needs is in
-    // `<head>`, which arrives in the first few KB. Failing instead would drop
-    // the Guardian, which serves 654 KB with no `og:` tags and a perfectly good
-    // `<title>` in the first one.
+    // Over-cap truncates rather than failing. The metadata sits far earlier
+    // than `</head>` does, so the cap keeps it and discards the rest: measured
+    // 2026-09-04, the Guardian's `<title>` is at byte 195 with `</head>` at
+    // 661 KB, and CNN's `og:title` at 310 KB with `</head>` at 2.4 MB. Failing
+    // at the cap would drop both.
+    //
+    // 310 KB is the worst offset measured, so 512 KB clears it by 1.6x — not
+    // by an order of magnitude. Do not lower this cap without re-measuring.
     //
     // So there is deliberately no `content_length()` pre-check, which the PRD
     // asked for: refusing an honestly-declared 654 KB while happily truncating
