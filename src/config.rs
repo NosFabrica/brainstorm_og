@@ -30,8 +30,27 @@ pub struct Config {
     /// bounds a burst of distinct ones, each of which costs a fetch and a raster.
     ///
     /// Also the memory bound that matters: each render holds a ~3 MB pixmap plus
-    /// a decoded avatar (capped at 32 MB), so this multiplies against the
-    /// container limit. 8 x 32 MB plus the 64 MB card cache fits 512Mi.
+    /// a decoded avatar (capped at `avatar_max_bytes` on the wire and 32 MB
+    /// decoded), so this multiplies against the container limit.
+    ///
+    /// Re-derived 2026-09-11 against measurements; the old note here read
+    /// "8 x 32 MB plus the 64 MB card cache fits 512Mi", which predated both
+    /// the link-preview cache and `max_concurrent_previews` and assumed a
+    /// runtime floor about four times what it is:
+    ///
+    ///   8 renders x 32 MB decode ceiling ...... 256 MB  (bound, not typical)
+    ///   16 previews x 512 KB body cap .........   8 MB
+    ///   cache ceilings (64 png + 16 preview) ..  82 MB
+    ///   runtime floor .........................  25 MB
+    ///                                    peak  ~ 371 MB of 512Mi
+    ///
+    /// The 32 MB is a decode ceiling reached only by a maximal source image:
+    /// eight concurrent renders with no avatar moved measured RSS by nothing.
+    /// A card PNG measures ~113 KB, so the 64 MB cache holds roughly 590.
+    ///
+    /// This and `max_concurrent_previews` are independent budgets that can
+    /// coincide, so raising either without redoing this sum is how the pod
+    /// starts OOMKilling.
     pub max_concurrent_renders: usize,
     /// Salt folded into the `?v=` image hash.
     ///
