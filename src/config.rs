@@ -79,6 +79,16 @@ pub struct Config {
     /// entry-bounded because entry size varies by an order of magnitude, and
     /// the figure that has to fit the pod's memory limit is bytes.
     pub link_preview_cache_max_bytes: u64,
+    /// How long a robots.txt we successfully read stays good for. Only the
+    /// first preview per origin pays the round trip.
+    pub robots_cache_ttl_secs: u64,
+    /// Origins we hold robots.txt for. Small values, so this is bounded by
+    /// entries rather than bytes.
+    pub robots_cache_capacity: u64,
+    /// Shorter than the page timeout: robots.txt is small and sits in front of
+    /// the fetch a reader is waiting on, so it must not be able to spend the
+    /// whole deadline on its own.
+    pub robots_timeout_secs: u64,
     /// Requests per window from traffic our own SPA originated. High enough
     /// that a real user never meets it.
     pub link_preview_rate_trusted: u32,
@@ -148,6 +158,9 @@ impl Config {
             max_concurrent_previews: parse("MAX_CONCURRENT_PREVIEWS", 16),
             link_preview_cache_ttl_secs: parse("LINK_PREVIEW_CACHE_TTL_SECS", 86_400),
             link_preview_cache_max_bytes: parse("LINK_PREVIEW_CACHE_MAX_BYTES", 16 * 1024 * 1024),
+            robots_cache_ttl_secs: parse("ROBOTS_CACHE_TTL_SECS", 86_400),
+            robots_cache_capacity: parse("ROBOTS_CACHE_CAPACITY", 4_096),
+            robots_timeout_secs: parse("ROBOTS_TIMEOUT_SECS", 2),
             link_preview_rate_trusted: parse("LINK_PREVIEW_RATE_TRUSTED", 600),
             link_preview_rate_untrusted: parse("LINK_PREVIEW_RATE_UNTRUSTED", 20),
             link_preview_rate_window_secs: parse("LINK_PREVIEW_RATE_WINDOW_SECS", 60),
@@ -220,5 +233,10 @@ mod tests {
         // the shared peer address, which is the bug this whole scheme exists
         // to avoid.
         assert!(c.trusted_proxy_hops >= 1);
+        // robots.txt is fetched before the page and inside the same deadline,
+        // so its timeout plus a page hop must still fit.
+        assert!(
+            c.robots_timeout_secs + c.link_preview_timeout_secs <= c.link_preview_deadline_secs
+        );
     }
 }

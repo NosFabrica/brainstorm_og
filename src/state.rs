@@ -33,6 +33,9 @@ pub struct AppState {
     pub preview_rate: Cache<String, Arc<AtomicU64>>,
     /// Parsed previews, keyed by normalised URL.
     pub link_preview_cache: crate::link_preview::cache::PreviewCache,
+    /// robots.txt per origin. Keyed on origin, not URL: the file governs the
+    /// whole host, and only the first preview per host should pay for it.
+    pub robots_cache: crate::link_preview::robots::RobotsCache,
 }
 
 impl AppState {
@@ -117,6 +120,10 @@ impl AppState {
             config.link_preview_cache_max_bytes,
             Duration::from_secs(config.link_preview_cache_ttl_secs),
         );
+        let robots_cache = crate::link_preview::robots::store(
+            config.robots_cache_capacity,
+            Duration::from_secs(config.robots_cache_ttl_secs),
+        );
 
         Ok(Self {
             config: Arc::new(config),
@@ -129,6 +136,7 @@ impl AppState {
             png_cache,
             preview_rate,
             link_preview_cache,
+            robots_cache,
         })
     }
 }

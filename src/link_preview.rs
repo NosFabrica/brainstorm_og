@@ -18,6 +18,7 @@
 pub mod cache;
 pub mod parse;
 pub mod rate_limit;
+pub mod robots;
 
 use axum::{
     extract::{Query, State},
@@ -44,8 +45,9 @@ pub(crate) const SCHEMES: &[&str] = &["http", "https"];
 /// We stop reading once `<head>` has closed — everything a preview needs is
 /// inside it, and the rest is bytes nobody looks at. Measured over 48 sites,
 /// this cuts what we pull by ~60%, with the median read dropping from the
-/// whole page to 9.5 KB. Being a light fetcher is also the commitment ADR (ii)
-/// rests on when it declines to consult robots.txt.
+/// whole page to 9.5 KB. Being a light fetcher is the other half of what ADR
+/// (ii) promises, alongside honouring robots.txt: identify honestly, take only
+/// what a preview needs, and respect the directive.
 const HEAD_TAG: &[u8] = b"</head";
 
 /// ...but never stop before this. A few real sites close `<head>` and then put
@@ -152,13 +154,24 @@ pub async fn link_preview(State(st): State<AppState>, Query(q): Query<PreviewQue
     };
 
     let loader = st.clone();
+    let key = target.to_string();
+    let for_cache = key.clone();
     let outcome = st
         .link_preview_cache
-        .get_with(target.to_string(), async move {
+        .get_with(for_cache, async move {
             match fetch_url(&loader, target).await {
                 // A 200 with nulls is a real answer: a page with no usable
                 // markup degrades the card rather than erroring.
-                Ok(page) => Outcome::Ok(parse::preview(&page, loader.config.reserved_policy())),
+                Ok(Some(page)) => {
+                    Outcome::Ok(parse::preview(&page, loader.config.reserved_policy()))
+                }
+                // robots.txt refused us. Also a real answer, and the same one:
+                // nothing went wrong, nothing is worth retrying, and the card
+                // degrades exactly as it does for a page with no markup.
+                Ok(None) => Outcome::Ok(parse::Preview {
+                    url: key,
+                    ..Default::default()
+                }),
                 Err(e) => Outcome::Failed(e),
             }
         })
@@ -183,14 +196,14 @@ fn refused(e: PreviewError) -> Response {
 
 /// Fetch a third-party page, or say why not. Public so a test can parse what
 /// it returns without going back through the router.
-pub async fn fetch(st: &AppState, raw: &str) -> Result<Page, PreviewError> {
+pub async fn fetch(st: &AppState, raw: &str) -> Result<Option<Page>, PreviewError> {
     let target = cache::normalise(raw).ok_or(PreviewError::Refused("unparseable url"))?;
     fetch_url(st, target).await
 }
 
 /// The fetch proper. The handler already has a parsed URL — it normalised one
 /// to build the cache key — so handing a string back would be re-parsing.
-async fn fetch_url(st: &AppState, target: Url) -> Result<Page, PreviewError> {
+async fn fetch_url(st: &AppState, target: Url) -> Result<Option<Page>, PreviewError> {
     let deadline = Duration::from_secs(st.config.link_preview_deadline_secs);
     // Bounds the whole chain, not each hop: three hops that each answer just
     // inside the per-hop timeout would otherwise sit well past it.
@@ -199,10 +212,15 @@ async fn fetch_url(st: &AppState, target: Url) -> Result<Page, PreviewError> {
         .unwrap_or(Err(PreviewError::Timeout))
 }
 
-async fn follow_and_read(st: &AppState, target: Url) -> Result<Page, PreviewError> {
+async fn follow_and_read(st: &AppState, target: Url) -> Result<Option<Page>, PreviewError> {
     let max = st.config.link_preview_max_bytes;
     let per_hop = Duration::from_secs(st.config.link_preview_timeout_secs);
     let mut target = validate(st, target.as_str()).await?;
+    match robots_gate(st, &target).await {
+        Gate::Go => {}
+        Gate::Refused => return Ok(None),
+        Gate::Failed(e) => return Err(e),
+    }
 
     // Redirects are followed here rather than by reqwest, which is configured
     // not to: its policy runs before we can re-check the destination, so an
@@ -235,6 +253,13 @@ async fn follow_and_read(st: &AppState, target: Url) -> Result<Page, PreviewErro
             .join(location)
             .map_err(|_| PreviewError::Refused("unparseable redirect target"))?;
         target = validate(st, next.as_str()).await?;
+        // Every hop is judged, exactly as the address is: a redirect must not
+        // be a way around the directive on the host it lands on.
+        match robots_gate(st, &target).await {
+            Gate::Go => {}
+            Gate::Refused => return Ok(None),
+            Gate::Failed(e) => return Err(e),
+        }
     };
 
     if !resp.status().is_success() {
@@ -302,12 +327,12 @@ async fn follow_and_read(st: &AppState, target: Url) -> Result<Page, PreviewErro
         }
     }
 
-    Ok(Page {
+    Ok(Some(Page {
         final_url: target,
         content_type,
         body,
         truncated,
-    })
+    }))
 }
 
 /// Offset just past a case-insensitive `</head`, searching from `from`.
@@ -319,6 +344,30 @@ fn find_head_end(hay: &[u8], from: usize) -> Option<usize> {
         .windows(HEAD_TAG.len())
         .position(|w| w.eq_ignore_ascii_case(HEAD_TAG))
         .map(|i| from + i + HEAD_TAG.len())
+}
+
+/// What robots.txt lets us do next.
+///
+/// `Refused` and `Failed` both stop the fetch but produce different responses,
+/// and the difference is about caching. A `Disallow` will still be true
+/// tomorrow, so it is an answer: 200 with nulls, cached for a day. A file we
+/// could not read is a fact about right now, so it is `no-store` — otherwise a
+/// host that was down for a minute would read as "this link has no preview"
+/// until this time tomorrow.
+enum Gate {
+    Go,
+    Refused,
+    Failed(PreviewError),
+}
+
+async fn robots_gate(st: &AppState, target: &Url) -> Gate {
+    match robots::verdict(st, target).await {
+        robots::Verdict::Allowed => Gate::Go,
+        robots::Verdict::Disallowed => Gate::Refused,
+        robots::Verdict::Unreadable => {
+            Gate::Failed(PreviewError::Upstream("robots.txt could not be read"))
+        }
+    }
 }
 
 async fn validate(st: &AppState, raw: &str) -> Result<Url, PreviewError> {
