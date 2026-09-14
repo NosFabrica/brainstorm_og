@@ -38,10 +38,33 @@ use crate::state::AppState;
 pub const TOKEN: &str = "brainstormbot";
 
 /// A robots.txt we could not read disallows everything, per RFC 9309 §2.3.1.4
-/// — but for minutes, not the full day. Taking this branch is the difference
-/// between complying and saying we comply; capping it short is what stops one
-/// upstream blip from hiding a domain until tomorrow.
-pub const UNREADABLE_TTL: Duration = Duration::from_secs(300);
+/// — but for a minute, not the day. Taking this branch is the difference
+/// between complying and saying we comply; keeping it short is what stops one
+/// upstream blip from hiding a domain. It was five minutes until a transient
+/// failure blanked nostrmag.com for that long in testing.
+pub const UNREADABLE_TTL: Duration = Duration::from_secs(60);
+
+/// Pause before the single retry, so a connection that was just reset has a
+/// moment to come back.
+const RETRY_DELAY: Duration = Duration::from_millis(150);
+
+/// Why a robots.txt read failed, as far as the retry decision cares.
+enum ReadError {
+    /// Refused or reset while connecting. Fails in milliseconds and is usually
+    /// a blip, so it earns one retry.
+    Connect,
+    /// Everything else: timeouts (retrying doubles the wait), 5xx and odd
+    /// redirects (retrying hammers a site that is struggling), refused addresses.
+    Other,
+}
+
+fn classify(e: reqwest::Error) -> ReadError {
+    if e.is_connect() && !e.is_timeout() {
+        ReadError::Connect
+    } else {
+        ReadError::Other
+    }
+}
 
 /// RFC 9309 §2.5 asks for at least 500 KiB to be parsed.
 const MAX_ROBOTS_BYTES: usize = 512 * 1024;
@@ -255,25 +278,30 @@ async fn fetch(st: &AppState, origin: &str) -> Rules {
     let Ok(url) = Url::parse(&format!("{origin}/robots.txt")) else {
         return Rules::unreadable();
     };
-    match read(st, url).await {
+    let mut result = read(st, url.clone()).await;
+    if matches!(result, Err(ReadError::Connect)) {
+        tokio::time::sleep(RETRY_DELAY).await;
+        result = read(st, url).await;
+    }
+    match result {
         // A file we understood.
         Ok(Some(text)) => parse(&text, TOKEN),
         // 4xx is "no robots.txt here", which RFC 9309 §2.3.1.3 reads as full
         // allowance — the common case for most of the web.
         Ok(None) => Rules::allow_all(),
         // 5xx, a refused address, a timeout: §2.3.1.4 says assume disallow.
-        Err(()) => Rules::unreadable(),
+        Err(_) => Rules::unreadable(),
     }
 }
 
 /// Redirects are followed by hand for the same reason the page fetch does it:
 /// the client cannot re-check an address it has already dialled.
-async fn read(st: &AppState, url: Url) -> Result<Option<String>, ()> {
+async fn read(st: &AppState, url: Url) -> Result<Option<String>, ReadError> {
     let timeout = Duration::from_secs(st.config.robots_timeout_secs);
     let policy = st.config.reserved_policy();
     let mut target = net::validate_and_resolve_with(url.as_str(), super::SCHEMES, policy)
         .await
-        .map_err(|_| ())?;
+        .map_err(|_| ReadError::Other)?;
 
     let mut hops = 0u8;
     let resp = loop {
@@ -284,24 +312,24 @@ async fn read(st: &AppState, url: Url) -> Result<Option<String>, ()> {
             .timeout(timeout)
             .send()
             .await
-            .map_err(|_| ())?;
+            .map_err(classify)?;
 
         if !resp.status().is_redirection() {
             break resp;
         }
         hops += 1;
         if hops > MAX_HOPS {
-            return Err(());
+            return Err(ReadError::Other);
         }
         let location = resp
             .headers()
             .get(header::LOCATION)
             .and_then(|v| v.to_str().ok())
-            .ok_or(())?;
-        let next = target.join(location).map_err(|_| ())?;
+            .ok_or(ReadError::Other)?;
+        let next = target.join(location).map_err(|_| ReadError::Other)?;
         target = net::validate_and_resolve_with(next.as_str(), super::SCHEMES, policy)
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| ReadError::Other)?;
     };
 
     let status = resp.status();
@@ -309,7 +337,7 @@ async fn read(st: &AppState, url: Url) -> Result<Option<String>, ()> {
         return Ok(None);
     }
     if !status.is_success() {
-        return Err(());
+        return Err(ReadError::Other);
     }
 
     // Capped while streaming, like the page body: Content-Length is a claim.
@@ -317,7 +345,7 @@ async fn read(st: &AppState, url: Url) -> Result<Option<String>, ()> {
     let mut body: Vec<u8> = Vec::new();
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| ())?;
+        let chunk = chunk.map_err(|_| ReadError::Other)?;
         body.extend_from_slice(&chunk);
         if body.len() >= MAX_ROBOTS_BYTES {
             body.truncate(MAX_ROBOTS_BYTES);
@@ -327,7 +355,7 @@ async fn read(st: &AppState, url: Url) -> Result<Option<String>, ()> {
     Ok(Some(String::from_utf8_lossy(&body).into_owned()))
 }
 
-/// A file we read lasts a day; one we could not read, minutes.
+/// A file we read lasts a day; one we could not read, a minute.
 pub struct RobotsExpiry {
     pub read: Duration,
     pub unreadable: Duration,
@@ -450,6 +478,25 @@ mod tests {
         // meant for someone else lands on us.
         let r = rules("User-agent: OtherBot\nDisallow: /\n\nUser-agent: *\nAllow: /\n");
         assert!(r.allows("/anything"));
+    }
+
+    #[test]
+    fn an_unreadable_verdict_lasts_a_minute_not_the_day() {
+        use moka::Expiry as _;
+        let expiry = RobotsExpiry {
+            read: Duration::from_secs(86_400),
+            unreadable: UNREADABLE_TTL,
+        };
+        let now = std::time::Instant::now();
+        let key = String::new();
+        assert_eq!(
+            expiry.expire_after_create(&key, &Arc::new(Rules::unreadable()), now),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            expiry.expire_after_create(&key, &Arc::new(Rules::allow_all()), now),
+            Some(Duration::from_secs(86_400))
+        );
     }
 
     #[test]

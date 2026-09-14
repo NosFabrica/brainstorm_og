@@ -277,3 +277,44 @@ async fn robots_txt_cannot_redirect_us_into_a_reserved_address() {
     );
     assert_eq!(res.cache, "no-store");
 }
+
+#[tokio::test]
+async fn a_refused_connection_is_retried_once_before_blanking_the_domain() {
+    // The blip that blanked nostrmag.com in testing: nothing answers the first
+    // robots.txt request. Here nothing is listening yet — the connection is
+    // refused in milliseconds — and the site comes up before the retry.
+    let port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let app = Router::new()
+            .route("/robots.txt", get(|| async { "User-agent: *\nAllow: /\n" }))
+            .fallback(get(|| async {
+                ([(header::CONTENT_TYPE, "text/html")], HTML)
+            }));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let res = preview_on(&router(), &format!("http://127.0.0.1:{port}/page")).await;
+    assert_eq!(
+        res.status,
+        StatusCode::OK,
+        "one refused connection must not blank the domain"
+    );
+    assert_eq!(res.body["data"]["title"], "Stub Title");
+}
+
+#[tokio::test]
+async fn a_server_error_is_not_retried() {
+    // A 5xx means the site is struggling; asking again straight away is how a
+    // preview bot earns a block.
+    let stub = stub_site("", StatusCode::SERVICE_UNAVAILABLE).await;
+    let res = preview_on(&router(), &format!("{}/page", stub.base)).await;
+    assert_eq!(res.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(stub.robots_hits.load(Ordering::SeqCst), 1);
+}
