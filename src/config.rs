@@ -46,6 +46,8 @@ pub struct Config {
     ///
     /// The 32 MB is a decode ceiling reached only by a maximal source image:
     /// eight concurrent renders with no avatar moved measured RSS by nothing.
+    /// On the real musl image, 2048² avatars peaked ~250 MB and RSS fell back
+    /// to ~80 MB within seconds.
     /// A card PNG measures ~113 KB, so the 64 MB cache holds roughly 590.
     ///
     /// This and `max_concurrent_previews` are independent budgets that can
