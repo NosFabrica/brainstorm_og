@@ -26,7 +26,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::http::header;
+use axum::http::{header, HeaderMap, StatusCode};
 use moka::future::Cache;
 use url::Url;
 
@@ -48,14 +48,51 @@ pub const UNREADABLE_TTL: Duration = Duration::from_secs(60);
 /// moment to come back.
 const RETRY_DELAY: Duration = Duration::from_millis(150);
 
+/// A host that answers 429 or 503 is asking us to slow down, and a preview bot
+/// that ignores that gets blocked. We stop fetching from the whole host for
+/// its `Retry-After`, held between these bounds.
+pub const MIN_BACKOFF: Duration = Duration::from_secs(60);
+pub const MAX_BACKOFF: Duration = Duration::from_secs(600);
+
 /// Why a robots.txt read failed, as far as the retry decision cares.
 enum ReadError {
     /// Refused or reset while connecting. Fails in milliseconds and is usually
     /// a blip, so it earns one retry.
     Connect,
+    /// The host said slow down (429/503). Not retried; backs off the host.
+    RateLimited(Duration),
     /// Everything else: timeouts (retrying doubles the wait), 5xx and odd
     /// redirects (retrying hammers a site that is struggling), refused addresses.
     Other,
+}
+
+/// `Retry-After` in seconds, clamped. The HTTP-date form and anything
+/// unparseable get the minimum.
+pub fn retry_after(headers: &HeaderMap) -> Duration {
+    headers
+        .get(header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(MIN_BACKOFF)
+        .clamp(MIN_BACKOFF, MAX_BACKOFF)
+}
+
+/// Asked to slow down. Every link on the host waits, not just the one asked
+/// about.
+pub fn is_slow_down(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::SERVICE_UNAVAILABLE
+}
+
+/// Stop fetching anything from this URL's host for the backoff it asked for.
+pub async fn back_off(st: &AppState, url: &Url, headers: &HeaderMap) {
+    let origin = url.origin().ascii_serialization();
+    if origin == "null" {
+        return;
+    }
+    st.robots_cache
+        .insert(origin, Arc::new(Rules::backing_off(retry_after(headers))))
+        .await;
 }
 
 fn classify(e: reqwest::Error) -> ReadError {
@@ -81,6 +118,8 @@ pub struct Rules {
     rules: Vec<(bool, String)>,
     /// Came from a failure rather than a file, so it expires sooner.
     pub unreadable: bool,
+    /// Set when the host asked us to slow down: how long to stay away.
+    pub backoff: Option<Duration>,
 }
 
 impl Rules {
@@ -93,6 +132,15 @@ impl Rules {
         Self {
             rules: vec![(false, "/".to_string())],
             unreadable: true,
+            backoff: None,
+        }
+    }
+
+    /// Refuses everything for as long as the host asked.
+    pub fn backing_off(for_: Duration) -> Self {
+        Self {
+            backoff: Some(for_),
+            ..Self::unreadable()
         }
     }
 
@@ -222,6 +270,7 @@ pub fn parse(text: &str, token: &str) -> Rules {
     Rules {
         rules: if names_us { specific } else { wildcard },
         unreadable: false,
+        backoff: None,
     }
 }
 
@@ -289,6 +338,7 @@ async fn fetch(st: &AppState, origin: &str) -> Rules {
         // 4xx is "no robots.txt here", which RFC 9309 §2.3.1.3 reads as full
         // allowance — the common case for most of the web.
         Ok(None) => Rules::allow_all(),
+        Err(ReadError::RateLimited(for_)) => Rules::backing_off(for_),
         // 5xx, a refused address, a timeout: §2.3.1.4 says assume disallow.
         Err(_) => Rules::unreadable(),
     }
@@ -333,6 +383,10 @@ async fn read(st: &AppState, url: Url) -> Result<Option<String>, ReadError> {
     };
 
     let status = resp.status();
+    // Before the 4xx check: 429 is a 4xx, but it means "slow down", not "no file".
+    if is_slow_down(status) {
+        return Err(ReadError::RateLimited(retry_after(resp.headers())));
+    }
     if status.is_client_error() {
         return Ok(None);
     }
@@ -369,7 +423,7 @@ impl moka::Expiry<String, Arc<Rules>> for RobotsExpiry {
         _now: std::time::Instant,
     ) -> Option<Duration> {
         Some(if value.unreadable {
-            self.unreadable
+            value.backoff.unwrap_or(self.unreadable)
         } else {
             self.read
         })
@@ -478,6 +532,35 @@ mod tests {
         // meant for someone else lands on us.
         let r = rules("User-agent: OtherBot\nDisallow: /\n\nUser-agent: *\nAllow: /\n");
         assert!(r.allows("/anything"));
+    }
+
+    #[test]
+    fn retry_after_is_honoured_within_bounds() {
+        let with = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(header::RETRY_AFTER, v.parse().unwrap());
+            retry_after(&h)
+        };
+        assert_eq!(with("120"), Duration::from_secs(120));
+        assert_eq!(with("5"), MIN_BACKOFF, "never shorter than a minute");
+        assert_eq!(with("86400"), MAX_BACKOFF, "never longer than ten minutes");
+        assert_eq!(with("Wed, 21 Oct 2026 07:28:00 GMT"), MIN_BACKOFF);
+        assert_eq!(retry_after(&HeaderMap::new()), MIN_BACKOFF);
+    }
+
+    #[test]
+    fn a_backoff_expires_when_the_host_asked() {
+        use moka::Expiry as _;
+        let expiry = RobotsExpiry {
+            read: Duration::from_secs(86_400),
+            unreadable: UNREADABLE_TTL,
+        };
+        let v = Arc::new(Rules::backing_off(Duration::from_secs(300)));
+        assert_eq!(
+            expiry.expire_after_create(&String::new(), &v, std::time::Instant::now()),
+            Some(Duration::from_secs(300))
+        );
+        assert!(!v.allows("/anything"));
     }
 
     #[test]

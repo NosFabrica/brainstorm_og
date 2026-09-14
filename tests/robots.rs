@@ -318,3 +318,66 @@ async fn a_server_error_is_not_retried() {
     assert_eq!(res.status, StatusCode::BAD_GATEWAY);
     assert_eq!(stub.robots_hits.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn a_429_on_robots_pauses_the_whole_host() {
+    let stub = stub_site("", StatusCode::TOO_MANY_REQUESTS).await;
+    let app = router();
+    for path in ["/one", "/two"] {
+        let res = preview_on(&app, &format!("{}{path}", stub.base)).await;
+        assert_eq!(res.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(res.cache, "no-store");
+    }
+    assert_eq!(
+        stub.robots_hits.load(Ordering::SeqCst),
+        1,
+        "asked to slow down, so we don't ask again"
+    );
+    assert_eq!(stub.page_hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_429_on_a_page_pauses_every_link_on_that_host() {
+    // One rate-limited article must stop us touching the rest of the site too,
+    // or a feed full of its links keeps hitting it and gets us blocked.
+    let page_hits = Arc::new(AtomicUsize::new(0));
+    let hits = page_hits.clone();
+    let app_stub = Router::new()
+        .route("/robots.txt", get(|| async { "User-agent: *\nAllow: /\n" }))
+        .route(
+            "/limited",
+            get(|| async {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(header::RETRY_AFTER, "120")],
+                    "slow down",
+                )
+                    .into_response()
+            }),
+        )
+        .fallback(get(move || {
+            let hits = hits.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                ([(header::CONTENT_TYPE, "text/html")], HTML).into_response()
+            }
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app_stub).await;
+    });
+
+    let app = router();
+    assert_eq!(
+        preview_on(&app, &format!("{base}/limited")).await.status,
+        StatusCode::BAD_GATEWAY
+    );
+    let other = preview_on(&app, &format!("{base}/other")).await;
+    assert_eq!(other.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        page_hits.load(Ordering::SeqCst),
+        0,
+        "the rest of the host must wait too"
+    );
+}

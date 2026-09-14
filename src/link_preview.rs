@@ -262,6 +262,12 @@ async fn follow_and_read(st: &AppState, target: Url) -> Result<Option<Page>, Pre
         }
     };
 
+    if robots::is_slow_down(resp.status()) {
+        // The host asked us to slow down. Every link on it waits, not just this
+        // one — a bot that keeps asking gets blocked.
+        robots::back_off(st, &target, resp.headers()).await;
+        return Err(PreviewError::Upstream("upstream asked us to slow down"));
+    }
     if !resp.status().is_success() {
         // Not `error_for_status`: its error renders the URL it was made from.
         return Err(PreviewError::Upstream("upstream returned an error status"));
