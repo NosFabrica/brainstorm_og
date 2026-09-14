@@ -29,6 +29,7 @@ pub async fn healthz(State(st): State<AppState>) -> Response {
             "preview_rate": cache_stats(&st.preview_rate),
             "link_preview": cache_stats(&st.link_preview_cache),
             "robots": cache_stats(&st.robots_cache),
+            "host_backoff": cache_stats(&st.host_backoff),
         },
     });
     (StatusCode::OK, axum::Json(body)).into_response()

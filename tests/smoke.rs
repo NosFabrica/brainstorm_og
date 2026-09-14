@@ -6,9 +6,11 @@
 //! for a pubkey we have never synced, and it must still be a valid card rather
 //! than an error.
 
+mod common;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use brainstorm_og::{build_router, config::Config, state::AppState};
+use brainstorm_og::config::Config;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
@@ -16,44 +18,12 @@ const NPUB: &str = "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh
 const APP: &str = "https://brainstorm.test";
 
 fn router() -> axum::Router {
-    let config = Config {
-        bind_addr: "127.0.0.1:0".into(),
-        // Refused instantly, so the deadline never actually gates the test.
-        api_base_url: "http://127.0.0.1:1".into(),
+    common::router_with(Config {
         app_base_url: APP.into(),
-        local_relay_url: "ws://127.0.0.1:1".into(),
-        card_cache_capacity: 16,
-        png_cache_max_bytes: 8 * 1024 * 1024,
-        cache_ttl_secs: 60,
-        html_cache_max_age: 300,
-        image_cache_max_age: 31_536_000,
-        provisional_ttl_secs: 5,
-        fetch_timeout_secs: 1,
-        avatar_timeout_secs: 1,
-        request_deadline_secs: 2,
-        avatar_max_bytes: 1024 * 1024,
-        max_concurrent_renders: 4,
-        render_epoch: "test".into(),
-        assets_dir: "assets".into(),
-        font_family: "Figtree".into(),
         link_preview_timeout_secs: 1,
         link_preview_deadline_secs: 2,
-        link_preview_max_bytes: 64 * 1024,
-        max_concurrent_previews: 4,
-        link_preview_cache_ttl_secs: 86_400,
-        robots_cache_ttl_secs: 86_400,
-        robots_cache_capacity: 4_096,
-        robots_timeout_secs: 2,
-        link_preview_cache_max_bytes: 1024 * 1024,
-        // Both tiers set alike and high: nothing in this file is about the
-        // limiter, and tests/rate_limit.rs is.
-        link_preview_rate_trusted: 600,
-        link_preview_rate_untrusted: 600,
-        link_preview_rate_window_secs: 60,
-        trusted_proxy_hops: 2,
-        allow_loopback_preview_targets: false,
-    };
-    build_router(AppState::new(config).expect("fonts must load from assets/"))
+        ..common::config()
+    })
 }
 
 async fn get(uri: &str) -> (StatusCode, Vec<(String, String)>, String) {

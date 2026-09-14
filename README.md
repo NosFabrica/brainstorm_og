@@ -51,7 +51,9 @@ the SPA's generic card rather than breaking anything.
   per RFC 9309 (token `BrainstormBot`, `Crawl-delay` ignored); a disallowed URL
   is a 200 with nulls, an unreadable robots.txt a 502 that blanks the host for
   60s. A 429 or 503 pauses the whole host for its `Retry-After` (60s–10 min).
-  Results are cached for a day (failures for five minutes) keyed on a
+  Results are cached for a day (failures for five minutes; a host that is
+  backing off or whose robots.txt can't be read is re-checked on the host's
+  own clock instead) keyed on a
   normalised URL — lowercased scheme and host, no fragment, and `utm_*`,
   `fbclid`, `gclid`, `msclkid`, `igshid` stripped from both the key and the
   request we send; `ref` is left alone. Loaded through a single flight, so a

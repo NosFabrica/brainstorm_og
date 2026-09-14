@@ -36,6 +36,9 @@ pub struct AppState {
     /// robots.txt per origin. Keyed on origin, not URL: the file governs the
     /// whole host, and only the first preview per host should pay for it.
     pub robots_cache: crate::link_preview::robots::RobotsCache,
+    /// Hosts that answered 429/503, until their `Retry-After` runs out. Shares
+    /// the robots.txt capacity: both are one entry per origin.
+    pub host_backoff: crate::link_preview::backoff::BackoffCache,
 }
 
 impl AppState {
@@ -124,6 +127,7 @@ impl AppState {
             config.robots_cache_capacity,
             Duration::from_secs(config.robots_cache_ttl_secs),
         );
+        let host_backoff = crate::link_preview::backoff::store(config.robots_cache_capacity);
 
         Ok(Self {
             config: Arc::new(config),
@@ -137,6 +141,7 @@ impl AppState {
             preview_rate,
             link_preview_cache,
             robots_cache,
+            host_backoff,
         })
     }
 }

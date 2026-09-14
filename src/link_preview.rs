@@ -1,21 +1,19 @@
 //! `GET /link-preview?url=…` — we fetch *someone else's* page. The inverse
 //! direction from an unfurl, which is a crawler reading our share link.
 //!
-//! CONTEXT.md still lists "link preview" as a banned synonym for **share
-//! card**; ticket 12 amends it, since this is a distinct concept rather than a
-//! second name for that one. Handler and fetch live together here rather than
-//! in `routes.rs` because ticket 03 grows the same module with a parser.
-//!
 //! The URL is attacker-controlled, so nothing here trusts it: `net` judges the
-//! address before every connection, redirects are followed by hand so each hop
+//! address before every connection, `hop` follows redirects by hand so each hop
 //! is judged too, and the body is capped while it streams rather than after it
-//! has been buffered.
+//! has been buffered. `robots` and `backoff` decide whether a host may be asked
+//! at all.
 //!
-//! `parse` turns those bytes into the four fields a card needs; this file
-//! stops at "we have the bytes". `rate_limit` keeps the whole thing from being
-//! an open fetch proxy.
+//! `parse` turns those bytes into the fields a card needs; this file stops at
+//! "we have the bytes". `rate_limit` keeps the whole thing from being an open
+//! fetch proxy.
 
+pub mod backoff;
 pub mod cache;
+pub(crate) mod hop;
 pub mod parse;
 pub mod rate_limit;
 pub mod robots;
@@ -30,7 +28,8 @@ use std::time::Duration;
 use url::Url;
 
 use crate::link_preview::cache::Outcome;
-use crate::net;
+use crate::link_preview::hop::{Arrived, FollowError, HopCheck};
+use crate::link_preview::parse::Kind;
 use crate::state::AppState;
 
 /// Honest, resolvable, and never another company's preview bot. The measured
@@ -57,10 +56,6 @@ const HEAD_TAG: &[u8] = b"</head";
 /// below the median `</head>` (9.5 KB), so it binds only on the anomalies.
 const HEAD_FLOOR: usize = 8 * 1024;
 
-/// One more than the redirect chains real sites use (http -> https -> www ->
-/// canonical) and few enough that a chain cannot be a work amplifier.
-const MAX_HOPS: u8 = 3;
-
 /// A rejected URL is rejected forever, so caches may absorb the retry.
 const REFUSED_CACHE: &str = "public, max-age=3600";
 /// An upstream failure is a fact about right now.
@@ -75,6 +70,8 @@ pub struct PreviewQuery {
 
 /// A fetched page, before anything has been read out of it.
 pub struct Page {
+    /// Decided from `Content-Type` while fetching; media bodies are never read.
+    pub kind: Kind,
     /// After redirects. `parse` resolves a relative `og:image` against this.
     pub final_url: Url,
     pub content_type: String,
@@ -99,6 +96,9 @@ pub enum PreviewError {
     NotHtml,
     /// The upstream did not answer usefully.
     Upstream(&'static str),
+    /// The host is off-limits for now: backing off, or its robots.txt could not
+    /// be read. Its state lives with the host, so this URL caches nothing.
+    Unavailable(&'static str),
     /// We ran out of time.
     Timeout,
 }
@@ -120,7 +120,7 @@ impl PreviewError {
                 "not an html document",
                 REFUSED_CACHE,
             ),
-            Self::Upstream(_) => (
+            Self::Upstream(_) | Self::Unavailable(_) => (
                 StatusCode::BAD_GATEWAY,
                 "upstream fetch failed",
                 FAILED_CACHE,
@@ -136,7 +136,7 @@ impl PreviewError {
     /// Safe to log: fixed strings, chosen here, never the request.
     fn reason(self) -> &'static str {
         match self {
-            Self::Refused(r) | Self::Upstream(r) => r,
+            Self::Refused(r) | Self::Upstream(r) | Self::Unavailable(r) => r,
             Self::NotHtml => "content type is not html",
             Self::Timeout => "deadline exceeded",
         }
@@ -213,85 +213,50 @@ async fn fetch_url(st: &AppState, target: Url) -> Result<Option<Page>, PreviewEr
 }
 
 async fn follow_and_read(st: &AppState, target: Url) -> Result<Option<Page>, PreviewError> {
-    let max = st.config.link_preview_max_bytes;
     let per_hop = Duration::from_secs(st.config.link_preview_timeout_secs);
-    let mut target = validate(st, target.as_str()).await?;
-    match robots_gate(st, &target).await {
-        Gate::Go => {}
-        Gate::Refused => return Ok(None),
-        Gate::Failed(e) => return Err(e),
-    }
-
-    // Redirects are followed here rather than by reqwest, which is configured
-    // not to: its policy runs before we can re-check the destination, so an
-    // automatic follow would let a public URL bounce us to an internal one.
-    let mut hops = 0u8;
-    let resp = loop {
-        let resp = st
-            .preview_http
-            .get(target.clone())
-            .header(header::ACCEPT, "text/html,application/xhtml+xml")
-            .timeout(per_hop)
-            .send()
-            .await
-            .map_err(classify)?;
-
-        if !resp.status().is_redirection() {
-            break resp;
-        }
-        hops += 1;
-        if hops > MAX_HOPS {
-            return Err(PreviewError::Upstream("too many redirects"));
-        }
-        let location = resp
-            .headers()
-            .get(header::LOCATION)
-            .and_then(|v| v.to_str().ok())
-            .ok_or(PreviewError::Upstream("redirect with no location"))?;
-        // Relative Locations are legal and common.
-        let next = target
-            .join(location)
-            .map_err(|_| PreviewError::Refused("unparseable redirect target"))?;
-        target = validate(st, next.as_str()).await?;
-        // Every hop is judged, exactly as the address is: a redirect must not
-        // be a way around the directive on the host it lands on.
-        match robots_gate(st, &target).await {
-            Gate::Go => {}
-            Gate::Refused => return Ok(None),
-            Gate::Failed(e) => return Err(e),
-        }
+    let accept = "text/html,application/xhtml+xml";
+    let (response, final_url) = match hop::follow(
+        st,
+        target.as_str(),
+        accept,
+        per_hop,
+        HopCheck::AddressAndHost,
+    )
+    .await?
+    {
+        Some(Arrived { response, url }) => (response, url),
+        // robots.txt disallows a hop: an answer, not an error.
+        None => return Ok(None),
     };
 
-    if robots::is_slow_down(resp.status()) {
-        // The host asked us to slow down. Every link on it waits, not just this
-        // one — a bot that keeps asking gets blocked.
-        robots::back_off(st, &target, resp.headers()).await;
-        return Err(PreviewError::Upstream("upstream asked us to slow down"));
+    let status = response.status();
+    if backoff::is_slow_down(status) {
+        backoff::back_off(st, &final_url, response.headers()).await;
+        return Err(PreviewError::Unavailable("upstream asked us to slow down"));
     }
-    if !resp.status().is_success() {
+    if !status.is_success() {
         // Not `error_for_status`: its error renders the URL it was made from.
         return Err(PreviewError::Upstream("upstream returned an error status"));
     }
 
-    let content_type = resp
+    let content_type = response
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    // Media hosts often serve pictures and clips from extensionless URLs
+    let kind = kind_of(&content_type).ok_or(PreviewError::NotHtml)?;
+    // Media hosts serve pictures and clips from extensionless URLs
     // (m.stacker.news), which the UI cannot tell from a page. The headers can;
     // the body is not read.
-    if is_image(&content_type) || is_video(&content_type) {
+    if kind != Kind::Page {
         return Ok(Some(Page {
-            final_url: target,
+            kind,
+            final_url,
             content_type,
             body: Vec::new(),
             truncated: false,
         }));
-    }
-    if !is_html(&content_type) {
-        return Err(PreviewError::NotHtml);
     }
 
     // Read at most the cap and stop, rather than buffering the whole body and
@@ -315,37 +280,27 @@ async fn follow_and_read(st: &AppState, target: Url) -> Result<Option<Page>, Pre
     // asked for: refusing an honestly-declared 654 KB while happily truncating
     // the same page when it arrives chunked would be incoherent. We read at
     // most the cap either way, so the check bought nothing.
-    let mut body: Vec<u8> = Vec::new();
-    let mut truncated = false;
     let mut head_end: Option<usize> = None;
-    let mut stream = resp.bytes_stream();
-    use futures_util::StreamExt as _;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(classify)?;
-        // Scan from just behind the tail so a `</head` split across two chunks
-        // is still found.
-        let scan_from = body.len().saturating_sub(HEAD_TAG.len() - 1);
-        let room = (max as usize).saturating_sub(body.len());
-        if chunk.len() > room {
-            body.extend_from_slice(&chunk[..room]);
-            truncated = true;
-            break;
-        }
-        body.extend_from_slice(&chunk);
-
-        if head_end.is_none() {
-            head_end = find_head_end(&body, scan_from);
-        }
-        // Whole chunks are kept rather than trimmed to the stop point: the
-        // extra bytes are already in hand, and cutting at an exact offset
-        // could slice a tag in half.
-        if head_end.is_some_and(|end| body.len() >= end.max(HEAD_FLOOR)) {
-            break;
-        }
-    }
+    let (body, truncated) = hop::read_capped(
+        response,
+        st.config.link_preview_max_bytes as usize,
+        |body, before| {
+            // Scan from just behind the previous tail so a `</head` split across
+            // two chunks is still found.
+            if head_end.is_none() {
+                head_end = find_head_end(body, before.saturating_sub(HEAD_TAG.len() - 1));
+            }
+            // Whole chunks are kept rather than trimmed to the stop point:
+            // cutting at an exact offset could slice a tag in half.
+            head_end.is_some_and(|end| body.len() >= end.max(HEAD_FLOOR))
+        },
+    )
+    .await
+    .map_err(classify)?;
 
     Ok(Some(Page {
-        final_url: target,
+        kind,
+        final_url,
         content_type,
         body,
         truncated,
@@ -363,66 +318,50 @@ fn find_head_end(hay: &[u8], from: usize) -> Option<usize> {
         .map(|i| from + i + HEAD_TAG.len())
 }
 
-/// What robots.txt lets us do next.
-///
-/// `Refused` and `Failed` both stop the fetch but produce different responses,
-/// and the difference is about caching. A `Disallow` will still be true
-/// tomorrow, so it is an answer: 200 with nulls, cached for a day. A file we
-/// could not read is a fact about right now, so it is `no-store` — otherwise a
-/// host that was down for a minute would read as "this link has no preview"
-/// until this time tomorrow.
-enum Gate {
-    Go,
-    Refused,
-    Failed(PreviewError),
-}
-
-async fn robots_gate(st: &AppState, target: &Url) -> Gate {
+/// Whether a host may be asked at all: not while it asked us to slow down, and
+/// only where its robots.txt allows. `Ok(false)` is a Disallow — an answer.
+pub(crate) async fn host_allows(st: &AppState, target: &Url) -> Result<bool, PreviewError> {
+    if backoff::is_backing_off(st, target).await {
+        return Err(PreviewError::Unavailable("upstream asked us to slow down"));
+    }
     match robots::verdict(st, target).await {
-        robots::Verdict::Allowed => Gate::Go,
-        robots::Verdict::Disallowed => Gate::Refused,
+        robots::Verdict::Allowed => Ok(true),
+        robots::Verdict::Disallowed => Ok(false),
         robots::Verdict::Unreadable => {
-            Gate::Failed(PreviewError::Upstream("robots.txt could not be read"))
+            Err(PreviewError::Unavailable("robots.txt could not be read"))
         }
     }
 }
 
-async fn validate(st: &AppState, raw: &str) -> Result<Url, PreviewError> {
-    net::validate_and_resolve_with(raw, SCHEMES, st.config.reserved_policy())
-        .await
-        // The error names the host it refused, which is the one thing that may
-        // not be logged. Only the fact survives.
-        .map_err(|_| PreviewError::Refused("url refused by address validation"))
+impl From<FollowError> for PreviewError {
+    fn from(e: FollowError) -> Self {
+        match e {
+            FollowError::Refused(r) => Self::Refused(r),
+            FollowError::Transport(e) => classify(e),
+            FollowError::Redirects(r) => Self::Upstream(r),
+            FollowError::Host(e) => e,
+        }
+    }
 }
 
-/// `parse` needs `<head>` markup; anything else is not worth the bytes. A
-/// missing type is refused too — guessing is how you end up parsing a PDF.
-/// Formats every browser can draw. Other `image/*` (TIFF, HEIC) stay a 415:
-/// telling the UI "image" for something it cannot render is worse than no card.
-pub(crate) fn is_image(content_type: &str) -> bool {
-    matches!(
-        essence(content_type).as_str(),
-        "image/jpeg" | "image/png" | "image/gif" | "image/webp" | "image/avif"
-    )
-}
-
-/// Formats browsers play in a `<video>` without a plugin.
-pub(crate) fn is_video(content_type: &str) -> bool {
-    matches!(essence(content_type).as_str(), "video/mp4" | "video/webm")
-}
-
-fn essence(content_type: &str) -> String {
-    content_type
+/// What the `Content-Type` says we fetched, or `None` for anything we won't use.
+/// A missing type is refused too — guessing is how you end up parsing a PDF.
+fn kind_of(content_type: &str) -> Option<Kind> {
+    let essence = content_type
         .split(';')
         .next()
         .unwrap_or_default()
         .trim()
-        .to_ascii_lowercase()
-}
-
-fn is_html(content_type: &str) -> bool {
-    let essence = essence(content_type);
-    essence == "text/html" || essence == "application/xhtml+xml"
+        .to_ascii_lowercase();
+    match essence.as_str() {
+        "text/html" | "application/xhtml+xml" => Some(Kind::Page),
+        // Formats every browser draws. TIFF and HEIC stay refused: telling the
+        // UI "image" for something it can't render is worse than no card.
+        "image/jpeg" | "image/png" | "image/gif" | "image/webp" | "image/avif" => Some(Kind::Image),
+        // Played in a `<video>` without a plugin; `video/quicktime` is Safari-only.
+        "video/mp4" | "video/webm" => Some(Kind::Video),
+        _ => None,
+    }
 }
 
 /// A `reqwest::Error` is discarded rather than wrapped: it renders the URL it
@@ -478,25 +417,24 @@ mod tests {
     }
 
     #[test]
-    fn html_types_are_recognised_with_parameters_and_casing() {
-        assert!(is_html("text/html"));
-        assert!(is_html("text/html; charset=utf-8"));
-        assert!(is_html("TEXT/HTML;charset=ISO-8859-1"));
-        assert!(is_html(" application/xhtml+xml "));
-        assert!(is_image("image/jpeg"));
-        assert!(is_image("IMAGE/PNG; q=1"));
-        assert!(!is_image("image/tiff"), "browsers cannot draw it");
-        assert!(!is_image("image/svg+xml"));
-        assert!(!is_image("application/pdf"));
-        assert!(is_video("video/mp4"));
-        assert!(is_video("VIDEO/WEBM; codecs=vp9"));
-        assert!(!is_video("video/quicktime"), "Safari-only");
-        assert!(!is_html("text/plain"));
-        assert!(!is_html("application/pdf"));
-        assert!(!is_html("application/json"));
+    fn content_types_are_classified_with_parameters_and_casing() {
+        assert_eq!(kind_of("text/html"), Some(Kind::Page));
+        assert_eq!(kind_of("text/html; charset=utf-8"), Some(Kind::Page));
+        assert_eq!(kind_of("TEXT/HTML;charset=ISO-8859-1"), Some(Kind::Page));
+        assert_eq!(kind_of(" application/xhtml+xml "), Some(Kind::Page));
+        assert_eq!(kind_of("image/jpeg"), Some(Kind::Image));
+        assert_eq!(kind_of("IMAGE/PNG; q=1"), Some(Kind::Image));
+        assert_eq!(kind_of("video/mp4"), Some(Kind::Video));
+        assert_eq!(kind_of("VIDEO/WEBM; codecs=vp9"), Some(Kind::Video));
+        assert_eq!(kind_of("image/tiff"), None, "browsers cannot draw it");
+        assert_eq!(kind_of("image/svg+xml"), None);
+        assert_eq!(kind_of("video/quicktime"), None, "Safari-only");
+        assert_eq!(kind_of("text/plain"), None);
+        assert_eq!(kind_of("application/pdf"), None);
+        assert_eq!(kind_of("application/json"), None);
         // A prefix match would wave this through.
-        assert!(!is_html("text/htmlish"));
-        assert!(!is_html(""));
+        assert_eq!(kind_of("text/htmlish"), None);
+        assert_eq!(kind_of(""), None);
     }
 
     #[test]

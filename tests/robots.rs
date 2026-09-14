@@ -7,11 +7,13 @@
 //!
 //! Issue: .scratch/link-preview/issues/13-honour-robots-txt.md
 
+mod common;
+
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use axum::response::IntoResponse;
 use axum::{routing::get, Router};
-use brainstorm_og::{build_router, config::Config, state::AppState};
+use brainstorm_og::config::Config;
 use http_body_util::BodyExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -98,22 +100,16 @@ async fn stub_with_redirecting_robots() -> String {
 }
 
 fn test_config() -> Config {
-    let mut c = Config::from_env();
-    c.assets_dir = "assets".into();
-    c.api_base_url = "http://127.0.0.1:1".into();
-    c.local_relay_url = "ws://127.0.0.1:1".into();
-    c.app_base_url = "https://brainstorm.test".into();
-    // The stub is on loopback, which every deployment refuses. No environment
-    // variable reaches this; it is a test seam and nothing else.
-    c.allow_loopback_preview_targets = true;
-    c.link_preview_timeout_secs = 2;
-    c.robots_timeout_secs = 1;
-    c.link_preview_deadline_secs = 4;
-    c
+    Config {
+        link_preview_timeout_secs: 2,
+        robots_timeout_secs: 1,
+        link_preview_deadline_secs: 4,
+        ..common::stub_config()
+    }
 }
 
 fn router() -> Router {
-    build_router(AppState::new(test_config()).expect("fonts must load from assets/"))
+    common::router_with(test_config())
 }
 
 struct Res {

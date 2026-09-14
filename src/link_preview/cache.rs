@@ -118,6 +118,9 @@ impl moka::Expiry<String, Outcome> for PreviewExpiry {
     ) -> Option<Duration> {
         Some(match value {
             Outcome::Ok(_) => self.ok,
+            // The host holds this state (robots.txt 60s, backoff per Retry-After).
+            // Keeping it per URL too would outlast both.
+            Outcome::Failed(PreviewError::Unavailable(_)) => Duration::ZERO,
             Outcome::Failed(_) => self.failed,
         })
     }
@@ -276,5 +279,41 @@ mod tests {
         assert_eq!(configured.link_preview_cache_ttl_secs, 86_400);
         assert_eq!(configured.link_preview_cache_max_bytes, 16_777_216);
         assert!(FAILURE_TTL.as_secs() < configured.link_preview_cache_ttl_secs);
+    }
+
+    #[test]
+    fn an_unavailable_host_is_not_held_against_the_url() {
+        // The host's own state decides when to ask again (robots.txt 60s,
+        // backoff per Retry-After); a five-minute copy per URL would outlast it.
+        let expiry = PreviewExpiry {
+            ok: Duration::from_secs(86_400),
+            failed: FAILURE_TTL,
+        };
+        let now = std::time::Instant::now();
+        let unavailable =
+            Outcome::Failed(PreviewError::Unavailable("robots.txt could not be read"));
+        let upstream = Outcome::Failed(PreviewError::Upstream("upstream returned an error status"));
+        assert_eq!(
+            expiry.expire_after_create(&String::new(), &unavailable, now),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            expiry.expire_after_create(&String::new(), &upstream, now),
+            Some(FAILURE_TTL)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zero_ttl_entry_is_gone_straight_away() {
+        let cache = store(1024 * 1024, Duration::from_secs(86_400));
+        let key = "https://example.com/a".to_string();
+        cache
+            .insert(
+                key.clone(),
+                Outcome::Failed(PreviewError::Unavailable("backing off")),
+            )
+            .await;
+        cache.run_pending_tasks().await;
+        assert!(cache.get(&key).await.is_none());
     }
 }

@@ -26,11 +26,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::http::{header, HeaderMap, StatusCode};
 use moka::future::Cache;
 use url::Url;
 
-use crate::net;
+use super::backoff;
+use super::hop::{self, Arrived, FollowError, HopCheck};
 use crate::state::AppState;
 
 /// Our product token. RFC 9309 §2.2.1 allows only letters, `_` and `-`, and
@@ -48,51 +48,14 @@ pub const UNREADABLE_TTL: Duration = Duration::from_secs(60);
 /// moment to come back.
 const RETRY_DELAY: Duration = Duration::from_millis(150);
 
-/// A host that answers 429 or 503 is asking us to slow down, and a preview bot
-/// that ignores that gets blocked. We stop fetching from the whole host for
-/// its `Retry-After`, held between these bounds.
-pub const MIN_BACKOFF: Duration = Duration::from_secs(60);
-pub const MAX_BACKOFF: Duration = Duration::from_secs(600);
-
 /// Why a robots.txt read failed, as far as the retry decision cares.
 enum ReadError {
     /// Refused or reset while connecting. Fails in milliseconds and is usually
     /// a blip, so it earns one retry.
     Connect,
-    /// The host said slow down (429/503). Not retried; backs off the host.
-    RateLimited(Duration),
-    /// Everything else: timeouts (retrying doubles the wait), 5xx and odd
-    /// redirects (retrying hammers a site that is struggling), refused addresses.
+    /// Everything else: timeouts (retrying doubles the wait), 5xx and slow-down
+    /// answers (retrying hammers a site that is struggling), refused addresses.
     Other,
-}
-
-/// `Retry-After` in seconds, clamped. The HTTP-date form and anything
-/// unparseable get the minimum.
-pub fn retry_after(headers: &HeaderMap) -> Duration {
-    headers
-        .get(header::RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(MIN_BACKOFF)
-        .clamp(MIN_BACKOFF, MAX_BACKOFF)
-}
-
-/// Asked to slow down. Every link on the host waits, not just the one asked
-/// about.
-pub fn is_slow_down(status: StatusCode) -> bool {
-    status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::SERVICE_UNAVAILABLE
-}
-
-/// Stop fetching anything from this URL's host for the backoff it asked for.
-pub async fn back_off(st: &AppState, url: &Url, headers: &HeaderMap) {
-    let origin = url.origin().ascii_serialization();
-    if origin == "null" {
-        return;
-    }
-    st.robots_cache
-        .insert(origin, Arc::new(Rules::backing_off(retry_after(headers))))
-        .await;
 }
 
 fn classify(e: reqwest::Error) -> ReadError {
@@ -106,20 +69,21 @@ fn classify(e: reqwest::Error) -> ReadError {
 /// RFC 9309 §2.5 asks for at least 500 KiB to be parsed.
 const MAX_ROBOTS_BYTES: usize = 512 * 1024;
 
-/// Same cap as a page fetch. A robots.txt behind four redirects is already odd.
-const MAX_HOPS: u8 = 3;
-
 pub type RobotsCache = Cache<String, Arc<Rules>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Rule {
+    allow: bool,
+    pattern: String,
+}
 
 /// The rules from the group that applies to us, in file order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Rules {
-    /// `(allow, pattern)`. Longest pattern wins; allow breaks a tie.
-    rules: Vec<(bool, String)>,
+    /// Longest pattern wins; allow breaks a tie.
+    rules: Vec<Rule>,
     /// Came from a failure rather than a file, so it expires sooner.
     pub unreadable: bool,
-    /// Set when the host asked us to slow down: how long to stay away.
-    pub backoff: Option<Duration>,
 }
 
 impl Rules {
@@ -130,17 +94,11 @@ impl Rules {
     /// Everything refused, and marked so the cache expires it in minutes.
     pub fn unreadable() -> Self {
         Self {
-            rules: vec![(false, "/".to_string())],
+            rules: vec![Rule {
+                allow: false,
+                pattern: "/".to_string(),
+            }],
             unreadable: true,
-            backoff: None,
-        }
-    }
-
-    /// Refuses everything for as long as the host asked.
-    pub fn backing_off(for_: Duration) -> Self {
-        Self {
-            backoff: Some(for_),
-            ..Self::unreadable()
         }
     }
 
@@ -148,7 +106,7 @@ impl Rules {
     /// length, and `Allow` wins a tie. No matching rule means allowed.
     pub fn allows(&self, path: &str) -> bool {
         let mut best: Option<(usize, bool)> = None;
-        for (allow, pattern) in &self.rules {
+        for Rule { allow, pattern } in &self.rules {
             if !matches(pattern, path) {
                 continue;
             }
@@ -216,8 +174,8 @@ fn matches(pattern: &str, path: &str) -> bool {
 /// carries no rules still wins — it means "you, specifically, may go anywhere".
 pub fn parse(text: &str, token: &str) -> Rules {
     let token = token.to_ascii_lowercase();
-    let mut specific: Vec<(bool, String)> = Vec::new();
-    let mut wildcard: Vec<(bool, String)> = Vec::new();
+    let mut specific: Vec<Rule> = Vec::new();
+    let mut wildcard: Vec<Rule> = Vec::new();
     let mut names_us = false;
 
     let mut agents: Vec<String> = Vec::new();
@@ -254,11 +212,15 @@ pub fn parse(text: &str, token: &str) -> Rules {
                     continue;
                 }
                 let allow = key == "allow";
+                let rule = Rule {
+                    allow,
+                    pattern: value.to_string(),
+                };
                 for agent in &agents {
                     if *agent == token {
-                        specific.push((allow, value.to_string()));
+                        specific.push(rule.clone());
                     } else if agent == "*" {
-                        wildcard.push((allow, value.to_string()));
+                        wildcard.push(rule.clone());
                     }
                 }
             }
@@ -270,18 +232,15 @@ pub fn parse(text: &str, token: &str) -> Rules {
     Rules {
         rules: if names_us { specific } else { wildcard },
         unreadable: false,
-        backoff: None,
     }
 }
 
 /// The origin's rules, fetched once and then cached. Concurrent callers for the
 /// same origin collapse onto one request.
 pub async fn rules_for(st: &AppState, url: &Url) -> Arc<Rules> {
-    let origin = url.origin().ascii_serialization();
-    // An opaque origin serialises to "null" and has no robots.txt to read.
-    if origin == "null" {
+    let Some(origin) = hop::origin_key(url) else {
         return Arc::new(Rules::allow_all());
-    }
+    };
     let loader = st.clone();
     let key = origin.clone();
     st.robots_cache
@@ -327,10 +286,10 @@ async fn fetch(st: &AppState, origin: &str) -> Rules {
     let Ok(url) = Url::parse(&format!("{origin}/robots.txt")) else {
         return Rules::unreadable();
     };
-    let mut result = read(st, url.clone()).await;
+    let mut result = read(st, &url).await;
     if matches!(result, Err(ReadError::Connect)) {
         tokio::time::sleep(RETRY_DELAY).await;
-        result = read(st, url).await;
+        result = read(st, &url).await;
     }
     match result {
         // A file we understood.
@@ -338,54 +297,32 @@ async fn fetch(st: &AppState, origin: &str) -> Rules {
         // 4xx is "no robots.txt here", which RFC 9309 §2.3.1.3 reads as full
         // allowance — the common case for most of the web.
         Ok(None) => Rules::allow_all(),
-        Err(ReadError::RateLimited(for_)) => Rules::backing_off(for_),
         // 5xx, a refused address, a timeout: §2.3.1.4 says assume disallow.
         Err(_) => Rules::unreadable(),
     }
 }
 
-/// Redirects are followed by hand for the same reason the page fetch does it:
-/// the client cannot re-check an address it has already dialled.
-async fn read(st: &AppState, url: Url) -> Result<Option<String>, ReadError> {
+async fn read(st: &AppState, url: &Url) -> Result<Option<String>, ReadError> {
     let timeout = Duration::from_secs(st.config.robots_timeout_secs);
-    let policy = st.config.reserved_policy();
-    let mut target = net::validate_and_resolve_with(url.as_str(), super::SCHEMES, policy)
-        .await
-        .map_err(|_| ReadError::Other)?;
-
-    let mut hops = 0u8;
-    let resp = loop {
-        let resp = st
-            .preview_http
-            .get(target.clone())
-            .header(header::ACCEPT, "text/plain")
-            .timeout(timeout)
-            .send()
-            .await
-            .map_err(classify)?;
-
-        if !resp.status().is_redirection() {
-            break resp;
-        }
-        hops += 1;
-        if hops > MAX_HOPS {
-            return Err(ReadError::Other);
-        }
-        let location = resp
-            .headers()
-            .get(header::LOCATION)
-            .and_then(|v| v.to_str().ok())
-            .ok_or(ReadError::Other)?;
-        let next = target.join(location).map_err(|_| ReadError::Other)?;
-        target = net::validate_and_resolve_with(next.as_str(), super::SCHEMES, policy)
-            .await
-            .map_err(|_| ReadError::Other)?;
+    let (response, target) = match hop::follow(
+        st,
+        url.as_str(),
+        "text/plain",
+        timeout,
+        HopCheck::AddressOnly,
+    )
+    .await
+    {
+        Ok(Some(Arrived { response, url })) => (response, url),
+        Err(FollowError::Transport(e)) => return Err(classify(e)),
+        Ok(None) | Err(_) => return Err(ReadError::Other),
     };
 
-    let status = resp.status();
+    let status = response.status();
     // Before the 4xx check: 429 is a 4xx, but it means "slow down", not "no file".
-    if is_slow_down(status) {
-        return Err(ReadError::RateLimited(retry_after(resp.headers())));
+    if backoff::is_slow_down(status) {
+        backoff::back_off(st, &target, response.headers()).await;
+        return Err(ReadError::Other);
     }
     if status.is_client_error() {
         return Ok(None);
@@ -393,19 +330,9 @@ async fn read(st: &AppState, url: Url) -> Result<Option<String>, ReadError> {
     if !status.is_success() {
         return Err(ReadError::Other);
     }
-
-    // Capped while streaming, like the page body: Content-Length is a claim.
-    use futures_util::StreamExt as _;
-    let mut body: Vec<u8> = Vec::new();
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| ReadError::Other)?;
-        body.extend_from_slice(&chunk);
-        if body.len() >= MAX_ROBOTS_BYTES {
-            body.truncate(MAX_ROBOTS_BYTES);
-            break;
-        }
-    }
+    let (body, _) = hop::read_capped(response, MAX_ROBOTS_BYTES, |_, _| false)
+        .await
+        .map_err(|_| ReadError::Other)?;
     Ok(Some(String::from_utf8_lossy(&body).into_owned()))
 }
 
@@ -423,7 +350,7 @@ impl moka::Expiry<String, Arc<Rules>> for RobotsExpiry {
         _now: std::time::Instant,
     ) -> Option<Duration> {
         Some(if value.unreadable {
-            value.backoff.unwrap_or(self.unreadable)
+            self.unreadable
         } else {
             self.read
         })
@@ -532,35 +459,6 @@ mod tests {
         // meant for someone else lands on us.
         let r = rules("User-agent: OtherBot\nDisallow: /\n\nUser-agent: *\nAllow: /\n");
         assert!(r.allows("/anything"));
-    }
-
-    #[test]
-    fn retry_after_is_honoured_within_bounds() {
-        let with = |v: &str| {
-            let mut h = HeaderMap::new();
-            h.insert(header::RETRY_AFTER, v.parse().unwrap());
-            retry_after(&h)
-        };
-        assert_eq!(with("120"), Duration::from_secs(120));
-        assert_eq!(with("5"), MIN_BACKOFF, "never shorter than a minute");
-        assert_eq!(with("86400"), MAX_BACKOFF, "never longer than ten minutes");
-        assert_eq!(with("Wed, 21 Oct 2026 07:28:00 GMT"), MIN_BACKOFF);
-        assert_eq!(retry_after(&HeaderMap::new()), MIN_BACKOFF);
-    }
-
-    #[test]
-    fn a_backoff_expires_when_the_host_asked() {
-        use moka::Expiry as _;
-        let expiry = RobotsExpiry {
-            read: Duration::from_secs(86_400),
-            unreadable: UNREADABLE_TTL,
-        };
-        let v = Arc::new(Rules::backing_off(Duration::from_secs(300)));
-        assert_eq!(
-            expiry.expire_after_create(&String::new(), &v, std::time::Instant::now()),
-            Some(Duration::from_secs(300))
-        );
-        assert!(!v.allows("/anything"));
     }
 
     #[test]

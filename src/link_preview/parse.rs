@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use url::Url;
 
-use super::{find_head_end, is_image, is_video, Page, HEAD_FLOOR, SCHEMES};
+use super::{find_head_end, Page, HEAD_FLOOR, SCHEMES};
 use crate::net::{self, Reserved};
 
 /// Caps, in characters. Long enough for any honest page — the longest
@@ -132,22 +132,25 @@ impl Tags {
 /// place the read did, so parsing stays bounded even if a caller hands over
 /// something larger.
 pub fn preview(page: &Page, reserved: Reserved) -> Preview {
-    if is_video(&page.content_type) {
-        return Preview {
-            kind: Kind::Video,
-            url: page.final_url.to_string(),
-            ..Default::default()
-        };
-    }
-    if is_image(&page.content_type) {
-        return Preview {
-            kind: Kind::Image,
-            image: net::validate_url_with(page.final_url.as_str(), SCHEMES, reserved)
-                .ok()
-                .map(|u| u.to_string()),
-            url: page.final_url.to_string(),
-            ..Default::default()
-        };
+    match page.kind {
+        Kind::Video => {
+            return Preview {
+                kind: Kind::Video,
+                url: page.final_url.to_string(),
+                ..Default::default()
+            }
+        }
+        Kind::Image => {
+            return Preview {
+                kind: Kind::Image,
+                image: net::validate_url_with(page.final_url.as_str(), SCHEMES, reserved)
+                    .ok()
+                    .map(|u| u.to_string()),
+                url: page.final_url.to_string(),
+                ..Default::default()
+            }
+        }
+        Kind::Page => {}
     }
     let html = decode(&page.content_type, &page.body[..head_cut(&page.body)]);
     let tags = scan(&html);
@@ -342,6 +345,7 @@ mod tests {
 
     fn page_bytes(url: &str, content_type: &str, body: Vec<u8>) -> Page {
         Page {
+            kind: Kind::Page,
             final_url: Url::parse(url).unwrap(),
             content_type: content_type.into(),
             body,

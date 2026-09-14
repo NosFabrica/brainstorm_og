@@ -1,9 +1,9 @@
 //! Per-IP rate limiting for `/link-preview`.
 //!
 //! The endpoint is unauthenticated and fetches arbitrary URLs, so without a
-//! limiter it is an open fetch proxy. Two tiers: traffic our own SPA
-//! originated gets a ceiling high enough that a real user never meets it,
-//! everything else gets a tight one.
+//! limiter it is an open fetch proxy. Two ceilings: trusted traffic — what our
+//! own SPA originated — gets one high enough that a real user never meets it,
+//! untrusted traffic gets a tight one.
 //!
 //! A fixed-window counter over moka, mirroring `validate_rate_limit` in
 //! `brainstorm_server` — the first request in a window creates the entry and
@@ -43,15 +43,14 @@ const LIMITED_CACHE: &str = "no-store";
 /// reason the untrusted rate is tight rather than the reason to raise this.
 const MAX_BUCKETS: u64 = 100_000;
 
-/// Which ceiling a request is measured against.
-///
-/// Not "tier" — CONTEXT.md's Language already owns that word for the GrapeRank
-/// score bucket, which `data::Overview` carries in this same crate.
+/// Which ceiling a request is measured against. Named after the config it
+/// reads (`LINK_PREVIEW_RATE_TRUSTED` / `_UNTRUSTED`). Not "tier": that already
+/// names the GrapeRank score bucket `data::Overview` carries in this crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Caller {
     /// Our own SPA, by `Sec-Fetch-Site` or a `Referer` under `APP_BASE_URL`.
-    SameOrigin,
-    Other,
+    Trusted,
+    Untrusted,
 }
 
 impl Caller {
@@ -60,15 +59,15 @@ impl Caller {
     /// behind it are measured against.
     fn tag(self) -> &'static str {
         match self {
-            Self::SameOrigin => "same-origin",
-            Self::Other => "other",
+            Self::Trusted => "trusted",
+            Self::Untrusted => "untrusted",
         }
     }
 
     fn limit(self, config: &Config) -> u32 {
         match self {
-            Self::SameOrigin => config.link_preview_rate_trusted,
-            Self::Other => config.link_preview_rate_untrusted,
+            Self::Trusted => config.link_preview_rate_trusted,
+            Self::Untrusted => config.link_preview_rate_untrusted,
         }
     }
 }
@@ -84,7 +83,7 @@ fn caller(headers: &HeaderMap, app_base_url: &str) -> Caller {
         .unwrap_or_default()
         .trim();
     if site.eq_ignore_ascii_case("same-origin") {
-        return Caller::SameOrigin;
+        return Caller::Trusted;
     }
 
     // Older browsers send no `Sec-Fetch-*` at all. Compared by parsed origin,
@@ -97,8 +96,8 @@ fn caller(headers: &HeaderMap, app_base_url: &str) -> Caller {
         .and_then(|v| Url::parse(v).ok());
     let app = Url::parse(app_base_url).ok();
     match (referer, app) {
-        (Some(r), Some(a)) if r.origin() == a.origin() => Caller::SameOrigin,
-        _ => Caller::Other,
+        (Some(r), Some(a)) if r.origin() == a.origin() => Caller::Trusted,
+        _ => Caller::Untrusted,
     }
 }
 
@@ -311,21 +310,21 @@ mod tests {
     fn sec_fetch_site_selects_the_ceiling() {
         for value in ["same-origin", "Same-Origin", " same-origin "] {
             let h = headers(&[("sec-fetch-site", value)]);
-            assert_eq!(caller(&h, APP), Caller::SameOrigin, "for {value:?}");
+            assert_eq!(caller(&h, APP), Caller::Trusted, "for {value:?}");
         }
         // `none` is a typed-in URL, `same-site` a sibling subdomain, and
         // `cross-site` someone else's page — none of them our SPA's fetch.
         for value in ["cross-site", "same-site", "none"] {
             let h = headers(&[("sec-fetch-site", value)]);
-            assert_eq!(caller(&h, APP), Caller::Other, "for {value:?}");
+            assert_eq!(caller(&h, APP), Caller::Untrusted, "for {value:?}");
         }
-        assert_eq!(caller(&HeaderMap::new(), APP), Caller::Other);
+        assert_eq!(caller(&HeaderMap::new(), APP), Caller::Untrusted);
     }
 
     #[test]
     fn a_referer_is_compared_by_origin_not_by_prefix() {
         let same = headers(&[("referer", "https://brainstorm.test/p/npub1abc")]);
-        assert_eq!(caller(&same, APP), Caller::SameOrigin);
+        assert_eq!(caller(&same, APP), Caller::Trusted);
 
         for lookalike in [
             "https://brainstorm.test.evil.example/",
@@ -335,7 +334,7 @@ mod tests {
             "not a url",
         ] {
             let h = headers(&[("referer", lookalike)]);
-            assert_eq!(caller(&h, APP), Caller::Other, "for {lookalike}");
+            assert_eq!(caller(&h, APP), Caller::Untrusted, "for {lookalike}");
         }
     }
 
@@ -344,6 +343,6 @@ mod tests {
         // The SPA's `fetch()` sends `Sec-Fetch-Site` and, under a
         // `no-referrer` policy, no `Referer` at all.
         let h = headers(&[("sec-fetch-site", "same-origin")]);
-        assert_eq!(caller(&h, APP), Caller::SameOrigin);
+        assert_eq!(caller(&h, APP), Caller::Trusted);
     }
 }
