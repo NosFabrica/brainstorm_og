@@ -4,13 +4,23 @@ Renders the share card and crawler-visible meta tags for `/p/{id}` and for the
 short share links `/s/{code}` resolve to. Replaces
 `Brainstorm-UI`'s `useShareMeta.ts`, a client-side stopgap invisible to crawlers.
 
+Also serves **link previews**: reading someone else's page for a link posted in
+a note, so the UI can show its title and image. Opposite direction, same
+service.
+
 ## Language
 
-**Share card**: the rendered 1200×630 image. _Avoid_: OG card, link preview,
-preview image. "OG" survives only in protocol names (`og:image`, `/og/`).
+**Share card**: the rendered 1200×630 image. _Avoid_: OG card, preview image —
+and not "link preview", which is a different thing below. "OG" survives only in
+protocol names (`og:image`, `/og/`).
 
-**Unfurl**: what a third-party crawler does with a share link. _Avoid_: preview,
-embed.
+**Unfurl**: what a third-party crawler does with *our* share link. Inbound only.
+_Avoid_: preview, embed.
+
+**Link preview**: what *we* fetch for a third-party URL found in a note — title,
+description, image, site name, read from that page's Open Graph tags. The
+inverse of an unfurl. Served at `/link-preview`. _Avoid_: unfurl (wrong
+direction), card (that's the share card).
 
 **Provisional card**: one assembled without a kind-0. Short TTL so it
 self-corrects rather than pinning a name-less card.
@@ -128,6 +138,50 @@ reach the resolver at all — the connector parses those itself.
 A whole answer is rejected when any address in it is reserved, rather than
 trimmed to the survivors. A name handing back one internal address is not one
 we want to reach at its other one, and it keeps the two checks agreeing.
+
+### Link previews are fetched here, not by `brainstorm_server`
+
+The service that dials attacker-supplied URLs is the one with no database
+credentials: a `scratch` image, read-only root, non-root, dropped capabilities.
+It also already had the address guard, the hand-followed redirects and the
+streaming caps. Putting it in the main API would have meant building all of
+that next to Neo4j, Postgres and Redis credentials.
+
+Not taken: reading previews from the note itself. NIP-92 `imeta` could carry
+Open Graph fields so no one fetches anything (nips PR #1674), but it has been
+dormant since March 2025 and almost no notes carry it.
+
+### We identify honestly and never impersonate
+
+`BrainstormBot/1.0 (+https://brainstorm.world/bot)`, always. Some sites serve
+metadata only to known preview bots: on 2026-09-04 reddit returned ~870 KB with
+`og:title` to `Twitterbot/1.0` and an 8 KB shell to an honest bot UA —
+Mastodon's real one included. Spoofing would "fix" that. Don't: it is lying
+about who we are, and it isn't even reliably better — `Twitterbot/1.0` was
+refused by cnn.com and timed out on geyser.fund, both of which served us fine.
+Measured cost of honesty: 4 of 56 sites.
+
+### We honour robots.txt, and back off when asked
+
+This reversed. It first took Slack's position — a preview a person triggers is
+not crawling, so robots exclusion doesn't apply — and that argument still holds
+on its own terms. Two things outweighed it: Cloudflare's Verified Bots
+programme requires compliance and is the only fix for Cloudflare-fronted sites
+as a class (Medium 403s every user-agent, browsers included), and the choice is
+one-way — complying can be relaxed later, being caught ignoring it can't be
+undone. Measured cost: nothing in the Nostr sample, mostly X in the mainstream
+one. X also disallows its own `/oembed`, so the "use the sanctioned API"
+escape doesn't exist.
+
+RFC 9309 rules, token `BrainstormBot`. `Crawl-delay` is ignored: not in the
+RFC, and 15–30s values are unworkable for a fetch someone is waiting on. A
+robots.txt that can't be read blanks the host for 60s, after one retry on a
+refused or reset connection only — never on timeouts or 5xx.
+
+A host that answers 429 or 503, on robots.txt or a page, pauses every fetch to
+that host for its `Retry-After`, held to 60s–10 min. A feed full of one site's
+links would otherwise keep hitting a site that asked us to stop, which is how a
+preview bot gets blocked.
 
 ## Accepted risk
 

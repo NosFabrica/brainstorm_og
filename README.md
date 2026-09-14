@@ -3,7 +3,11 @@
 Share-card service for Brainstorm profiles. When a crawler (Slack, X, Discord,
 Telegram, Facebook, …) fetches a profile URL, it gets per-profile `<meta>` tags
 and a generated card image — instead of the SPA's generic static card. Humans
-are never routed here; they keep getting the React app unchanged.
+are never routed to those; they keep getting the React app unchanged.
+
+It also serves **link previews** (`/link-preview`) for the UI: the title,
+description and image of a third-party page linked in a note, which the browser
+can't read itself. See `CONTEXT.md` for why that lives here.
 
 The app has no hard dependency on it: the UI's nginx falls back to serving the
 SPA when this service is absent or down, so removing it degrades unfurls back to
@@ -32,7 +36,7 @@ the SPA's generic card rather than breaking anything.
   a third party by ~59%. A page whose head runs past the cap is truncated, not
   refused. Non-`http(s)` or reserved addresses are 400,
   non-HTML is 415, an upstream that fails or times out is 502 / 504. The `url`
-  is never logged. `data` carries `{title, description, image, siteName, url}`,
+  is never logged. `data` carries `{kind, title, description, image, siteName, url}`,
   all nullable — `og:` first, then `twitter:` (X publishes nothing else), then
   `<title>` / `meta[name=description]`. `image` resolves against the final URL
   and is nulled unless it passes the same address check we dial by, since the
@@ -41,6 +45,12 @@ the SPA's generic card rather than breaking anything.
   origin is `APP_BASE_URL`), 20 for everything else, over which it is a 429. The
   address is read from `X-Forwarded-For` counting `TRUSTED_PROXY_HOPS` back from
   the **right**, so the entry the caller sent is never the one we key on.
+  `kind` is `page`, or `image` / `video` when the URL is itself media served
+  without a file extension (read from `Content-Type`, body never read; JPEG, PNG,
+  GIF, WebP, AVIF, MP4, WebM — other media stays 415). robots.txt is honoured
+  per RFC 9309 (token `BrainstormBot`, `Crawl-delay` ignored); a disallowed URL
+  is a 200 with nulls, an unreadable robots.txt a 502 that blanks the host for
+  60s. A 429 or 503 pauses the whole host for its `Retry-After` (60s–10 min).
   Results are cached for a day (failures for five minutes) keyed on a
   normalised URL — lowercased scheme and host, no fragment, and `utm_*`,
   `fbclid`, `gclid`, `msclkid`, `igshid` stripped from both the key and the
@@ -159,6 +169,9 @@ container; the caches are in-memory, so restarting is what resets them.
 | `LINK_PREVIEW_RATE_WINDOW_SECS` | `60` | the window both rates are counted over |
 | `TRUSTED_PROXY_HOPS` | `2` | entries back from the right of `X-Forwarded-For` |
 | `MAX_CONCURRENT_PREVIEWS` | `16` | in-flight link-preview fetches; queues past this |
+| `ROBOTS_CACHE_TTL_SECS` | `86400` | how long a read robots.txt is trusted |
+| `ROBOTS_CACHE_CAPACITY` | `4096` | origins whose robots.txt is held |
+| `ROBOTS_TIMEOUT_SECS` | `2` | robots.txt fetch; stays under the page timeout |
 | `RENDER_EPOCH` | crate version | salt for `?v=`; bump to force re-render |
 | `MAX_CONCURRENT_RENDERS` | `32` | in-flight card renders; queues past this |
 | `ASSETS_DIR` | `assets` | bundled fonts |
