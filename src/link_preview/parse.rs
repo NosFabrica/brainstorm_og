@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use url::Url;
 
-use super::{find_head_end, is_image, Page, HEAD_FLOOR, SCHEMES};
+use super::{find_head_end, is_image, is_video, Page, HEAD_FLOOR, SCHEMES};
 use crate::net::{self, Reserved};
 
 /// Caps, in characters. Long enough for any honest page — the longest
@@ -67,14 +67,15 @@ pub struct Preview {
     pub url: String,
 }
 
-/// What the link points at. An image link carries no markup to read, but the
-/// UI can still show the picture rather than a card naming its path.
+/// What the link points at. An image or video link carries no markup to read,
+/// but the UI can still show the media rather than a card naming its path.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     #[default]
     Page,
     Image,
+    Video,
 }
 
 impl Preview {
@@ -131,6 +132,13 @@ impl Tags {
 /// place the read did, so parsing stays bounded even if a caller hands over
 /// something larger.
 pub fn preview(page: &Page, reserved: Reserved) -> Preview {
+    if is_video(&page.content_type) {
+        return Preview {
+            kind: Kind::Video,
+            url: page.final_url.to_string(),
+            ..Default::default()
+        };
+    }
     if is_image(&page.content_type) {
         return Preview {
             kind: Kind::Image,

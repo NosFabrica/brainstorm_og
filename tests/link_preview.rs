@@ -166,6 +166,10 @@ async fn stub_site() -> Stub {
             }),
         )
         .route(
+            "/clip",
+            get(|| async { ([(header::CONTENT_TYPE, "video/mp4")], vec![0u8, 0, 0, 0x18]) }),
+        )
+        .route(
             "/tiff",
             get(|| async {
                 (
@@ -658,4 +662,14 @@ async fn an_image_browsers_cannot_draw_is_still_refused() {
     let stub = stub_site().await;
     let res = preview(&format!("{}/tiff", stub.base)).await;
     assert_eq!(res.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
+#[tokio::test]
+async fn an_extensionless_video_is_a_video_not_a_refusal() {
+    let stub = stub_site().await;
+    let url = format!("{}/clip", stub.base);
+    let res = preview(&url).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["data"]["kind"], "video");
+    assert_eq!(res.body["data"]["url"], url);
 }

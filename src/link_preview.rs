@@ -279,9 +279,10 @@ async fn follow_and_read(st: &AppState, target: Url) -> Result<Option<Page>, Pre
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    // Image hosts often serve pictures from extensionless URLs (m.stacker.news),
-    // which the UI cannot tell from a page. The headers can; the body is not read.
-    if is_image(&content_type) {
+    // Media hosts often serve pictures and clips from extensionless URLs
+    // (m.stacker.news), which the UI cannot tell from a page. The headers can;
+    // the body is not read.
+    if is_image(&content_type) || is_video(&content_type) {
         return Ok(Some(Page {
             final_url: target,
             content_type,
@@ -405,6 +406,11 @@ pub(crate) fn is_image(content_type: &str) -> bool {
     )
 }
 
+/// Formats browsers play in a `<video>` without a plugin.
+pub(crate) fn is_video(content_type: &str) -> bool {
+    matches!(essence(content_type).as_str(), "video/mp4" | "video/webm")
+}
+
 fn essence(content_type: &str) -> String {
     content_type
         .split(';')
@@ -482,6 +488,9 @@ mod tests {
         assert!(!is_image("image/tiff"), "browsers cannot draw it");
         assert!(!is_image("image/svg+xml"));
         assert!(!is_image("application/pdf"));
+        assert!(is_video("video/mp4"));
+        assert!(is_video("VIDEO/WEBM; codecs=vp9"));
+        assert!(!is_video("video/quicktime"), "Safari-only");
         assert!(!is_html("text/plain"));
         assert!(!is_html("application/pdf"));
         assert!(!is_html("application/json"));
