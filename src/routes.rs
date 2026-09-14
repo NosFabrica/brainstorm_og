@@ -7,7 +7,7 @@ use bytes::Bytes;
 use serde::Deserialize;
 
 use crate::data::{self, Card};
-use crate::nip19;
+use crate::nip19::{self, Pointer};
 use crate::render;
 use crate::state::AppState;
 
@@ -19,8 +19,39 @@ pub async fn healthz(State(st): State<AppState>) -> Response {
         "version": env!("CARGO_PKG_VERSION"),
         "font_family": st.config.font_family,
         "faces": st.fontdb.len(),
+        // Every memory figure for this service was previously arithmetic. moka
+        // hands these over for free, so what the caches actually hold is a
+        // fact rather than an estimate.
+        "caches": {
+            "card": cache_stats(&st.card_cache),
+            "short_code": cache_stats(&st.short_code_cache),
+            "png": cache_stats(&st.png_cache),
+            "preview_rate": cache_stats(&st.preview_rate),
+            "link_preview": cache_stats(&st.link_preview_cache),
+            "robots": cache_stats(&st.robots_cache),
+            "host_backoff": cache_stats(&st.host_backoff),
+        },
     });
     (StatusCode::OK, axum::Json(body)).into_response()
+}
+
+/// Both figures moka keeps, per cache.
+///
+/// `run_pending_tasks()` is deliberately not called: it would make these exact
+/// at the cost of doing the cache's housekeeping inline, and this endpoint is
+/// on a readiness probe. Approximate and cheap is the right trade — these are
+/// for capacity review, not accounting. A cache with no weigher weighs every
+/// entry as 1, so `weighted_size` there is the entry count by another name.
+fn cache_stats<K, V, S>(cache: &moka::future::Cache<K, V, S>) -> serde_json::Value
+where
+    K: std::hash::Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: std::hash::BuildHasher + Clone + Send + Sync + 'static,
+{
+    serde_json::json!({
+        "entry_count": cache.entry_count(),
+        "weighted_size": cache.weighted_size(),
+    })
 }
 
 /// Meta tags for crawlers. `/p/{id}` (canonical) and `/profile/{id}` (legacy).
@@ -34,19 +65,34 @@ pub async fn profile(State(st): State<AppState>, Path(id): Path<String>) -> Resp
     };
 
     let card = data::get_card(&st, &pointer).await;
-    let html = build_meta_html(&st, &id, &card);
+    meta_response(&st, &id, &card)
+}
 
+/// `/s/{code}` — a short share link. Renders the same card `/p/{id}` does.
+///
+/// An unresolvable code returns 404 rather than a card: a preview claiming a
+/// profile that doesn't exist is worse than no preview.
+pub async fn short_link(State(st): State<AppState>, Path(code): Path<String>) -> Response {
+    let Some(hex) = data::resolve_short_code(&st, &code).await else {
+        return unknown_code();
+    };
+
+    let pointer = Pointer { hex };
+    let card = data::get_card(&st, &pointer).await;
+    // Canonical names the profile, not the link that pointed at it — and as an
+    // npub, so a short-link share and a plain npub share consolidate into one
+    // page for crawlers. Relay hints are deliberately left out: they vary per
+    // link, and a canonical url that varies is not canonical.
+    let id = nip19::npub_from_hex(&pointer.hex).unwrap_or_else(|| pointer.hex.clone());
+    meta_response(&st, &id, &card)
+}
+
+/// Briefly cached, unlike `bad_id`: an unknown code is a fact about the
+/// database, not a permanently malformed input.
+fn unknown_code() -> Response {
     let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/html; charset=utf-8"),
-    );
-    // Short: this document exists to advertise the current `?v=`.
-    set_cache(
-        &mut headers,
-        &format!("public, max-age={}", st.config.html_cache_max_age),
-    );
-    (headers, Html(html)).into_response()
+    set_cache(&mut headers, "public, max-age=60");
+    (StatusCode::NOT_FOUND, headers).into_response()
 }
 
 /// `?v=` is the content hash. Never read; it exists so a changed card gets a
@@ -124,6 +170,22 @@ fn image_response(st: &AppState, bytes: Bytes) -> Response {
         ),
     );
     (headers, bytes).into_response()
+}
+
+/// The HTML response both `/p/{id}` and `/s/{code}` return.
+fn meta_response(st: &AppState, id: &str, card: &Card) -> Response {
+    let html = build_meta_html(st, id, card);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    // Short: this document exists to advertise the current `?v=`.
+    set_cache(
+        &mut headers,
+        &format!("public, max-age={}", st.config.html_cache_max_age),
+    );
+    (headers, Html(html)).into_response()
 }
 
 fn set_cache(headers: &mut HeaderMap, value: &str) {

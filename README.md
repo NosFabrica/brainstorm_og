@@ -3,7 +3,11 @@
 Share-card service for Brainstorm profiles. When a crawler (Slack, X, Discord,
 Telegram, Facebook, …) fetches a profile URL, it gets per-profile `<meta>` tags
 and a generated card image — instead of the SPA's generic static card. Humans
-are never routed here; they keep getting the React app unchanged.
+are never routed to those; they keep getting the React app unchanged.
+
+It also serves **link previews** (`/link-preview`) for the UI: the title,
+description and image of a third-party page linked in a note, which the browser
+can't read itself. See `CONTEXT.md` for why that lives here.
 
 The app has no hard dependency on it: the UI's nginx falls back to serving the
 SPA when this service is absent or down, so removing it degrades unfurls back to
@@ -16,8 +20,49 @@ the SPA's generic card rather than breaking anything.
   `Brainstorm-UI/client/src/lib/shareId.ts` accepts.
 - `GET /profile/{id}` → the same, kept only for links already in the wild.
   `og:url` and `canonical` still point at `/p/`.
+- `GET /s/{code}` → the same card for a **short share link**. The code is
+  resolved to a pubkey via the API and cached; `og:url` and `canonical` point at
+  `/p/`, since the card names the profile rather than the link to it. An
+  unresolvable code is a 404, never a card for a profile that doesn't exist.
+  Registered under `/S/` too: the QR payload is uppercase, and nginx proxies the
+  URI unchanged.
 - `GET /og/{id}.png?v={hash}` → 1200×630 PNG card.
-- `GET /healthz` → JSON with the loaded font family and face count.
+- `GET /link-preview?url={absolute http(s) url}` → JSON `{code, message, data}`
+  describing **someone else's** page: the inverse direction from the routes
+  above, which are about ours. The URL is attacker-controlled, so every hop is
+  address-checked, redirects are followed by hand and capped at 3, and the body
+  is capped while it streams. Reading stops once `</head>` closes (never before
+  8 KB — some sites put their tags just past it), which cuts what we pull from
+  a third party by ~59%. A page whose head runs past the cap is truncated, not
+  refused. Non-`http(s)` or reserved addresses are 400,
+  non-HTML is 415, an upstream that fails or times out is 502 / 504. The `url`
+  is never logged. `data` carries `{kind, title, description, image, siteName, url}`,
+  all nullable — `og:` first, then `twitter:` (X publishes nothing else), then
+  `<title>` / `meta[name=description]`. `image` resolves against the final URL
+  and is nulled unless it passes the same address check we dial by, since the
+  browser loads it on our say-so. Rate limited per client IP, at two rates: 600
+  a minute for our own SPA (`Sec-Fetch-Site: same-origin`, or a `Referer` whose
+  origin is `APP_BASE_URL`), 20 for everything else, over which it is a 429. The
+  address is read from `X-Forwarded-For` counting `TRUSTED_PROXY_HOPS` back from
+  the **right**, so the entry the caller sent is never the one we key on.
+  `kind` is `page`, or `image` / `video` when the URL is itself media served
+  without a file extension (read from `Content-Type`, body never read; JPEG, PNG,
+  GIF, WebP, AVIF, MP4, WebM — other media stays 415). robots.txt is honoured
+  per RFC 9309 (token `BrainstormBot`, `Crawl-delay` ignored); a disallowed URL
+  is a 200 with nulls, an unreadable robots.txt a 502 that blanks the host for
+  60s. A 429 or 503 pauses the whole host for its `Retry-After` (60s–10 min).
+  Results are cached for a day (failures for five minutes; a host that is
+  backing off or whose robots.txt can't be read is re-checked on the host's
+  own clock instead) keyed on a
+  normalised URL — lowercased scheme and host, no fragment, and `utm_*`,
+  `fbclid`, `gclid`, `msclkid`, `igshid` stripped from both the key and the
+  request we send; `ref` is left alone. Loaded through a single flight, so a
+  burst of viewers of one note is one outbound fetch. A successful response
+  carries the same `max-age`, so the browser and nginx cache it too.
+- `GET /healthz` → JSON with the loaded font family and face count, plus
+  `entry_count` and `weighted_size` per cache. Cheap enough for a readiness
+  probe: moka's own figures, read without forcing its housekeeping, so they lag
+  slightly rather than costing anything.
 
 ## The card
 
@@ -116,6 +161,19 @@ container; the caches are in-memory, so restarting is what resets them.
 | `AVATAR_TIMEOUT_SECS` | `5` | avatar image fetch |
 | `AVATAR_MAX_BYTES` | `5242880` (5 MB) | body cap before decode |
 | `REQUEST_DEADLINE_SECS` | `4` | whole-request budget |
+| `LINK_PREVIEW_TIMEOUT_SECS` | `3` | per redirect hop |
+| `LINK_PREVIEW_DEADLINE_SECS` | `5` | whole link-preview budget; must fit the router's |
+| `LINK_PREVIEW_MAX_BYTES` | `512000` | body cap; over this the page is truncated |
+| `LINK_PREVIEW_CACHE_TTL_SECS` | `86400` | preview TTL, and the response `max-age` |
+| `LINK_PREVIEW_CACHE_MAX_BYTES` | `16777216` (16 MB) | preview cache cap, weighed on key + value |
+| `LINK_PREVIEW_RATE_TRUSTED` | `600` | previews per window from our own SPA |
+| `LINK_PREVIEW_RATE_UNTRUSTED` | `20` | previews per window from everything else |
+| `LINK_PREVIEW_RATE_WINDOW_SECS` | `60` | the window both rates are counted over |
+| `TRUSTED_PROXY_HOPS` | `2` | entries back from the right of `X-Forwarded-For` |
+| `MAX_CONCURRENT_PREVIEWS` | `16` | in-flight link-preview fetches; queues past this |
+| `ROBOTS_CACHE_TTL_SECS` | `86400` | how long a read robots.txt is trusted |
+| `ROBOTS_CACHE_CAPACITY` | `4096` | origins whose robots.txt is held |
+| `ROBOTS_TIMEOUT_SECS` | `2` | robots.txt fetch; stays under the page timeout |
 | `RENDER_EPOCH` | crate version | salt for `?v=`; bump to force re-render |
 | `MAX_CONCURRENT_RENDERS` | `32` | in-flight card renders; queues past this |
 | `ASSETS_DIR` | `assets` | bundled fonts |
@@ -146,7 +204,7 @@ curl -s localhost:8080/og/$NPUB.png -o card.png
 
 ## Routing (who reaches this service)
 
-The UI pod's own nginx sends crawler User-Agents on `/p/*` here, and all of
-`/og/*` for everyone. Deliberately not the ingress: staging and prod share a
+The UI pod's own nginx sends crawler User-Agents on `/p/*` and `/s/*` here (the
+latter matched case-insensitively), and all of `/og/*` for everyone. Deliberately not the ingress: staging and prod share a
 cluster, so a map in the shared controller config would carry prod blast radius.
 See [`deploy/README.md`](deploy/README.md); the reasoning is in [`CONTEXT.md`](CONTEXT.md).

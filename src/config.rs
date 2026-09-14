@@ -30,8 +30,29 @@ pub struct Config {
     /// bounds a burst of distinct ones, each of which costs a fetch and a raster.
     ///
     /// Also the memory bound that matters: each render holds a ~3 MB pixmap plus
-    /// a decoded avatar (capped at 32 MB), so this multiplies against the
-    /// container limit. 8 x 32 MB plus the 64 MB card cache fits 512Mi.
+    /// a decoded avatar (capped at `avatar_max_bytes` on the wire and 32 MB
+    /// decoded), so this multiplies against the container limit.
+    ///
+    /// Re-derived 2026-09-11 against measurements; the old note here read
+    /// "8 x 32 MB plus the 64 MB card cache fits 512Mi", which predated both
+    /// the link-preview cache and `max_concurrent_previews` and assumed a
+    /// runtime floor about four times what it is:
+    ///
+    ///   8 renders x 32 MB decode ceiling ...... 256 MB  (bound, not typical)
+    ///   16 previews x 512 KB body cap .........   8 MB
+    ///   cache ceilings (64 png + 16 preview) ..  82 MB
+    ///   runtime floor .........................  25 MB
+    ///                                    peak  ~ 371 MB of 512Mi
+    ///
+    /// The 32 MB is a decode ceiling reached only by a maximal source image:
+    /// eight concurrent renders with no avatar moved measured RSS by nothing.
+    /// On the real musl image, 2048² avatars peaked ~250 MB and RSS fell back
+    /// to ~80 MB within seconds.
+    /// A card PNG measures ~113 KB, so the 64 MB cache holds roughly 590.
+    ///
+    /// This and `max_concurrent_previews` are independent budgets that can
+    /// coincide, so raising either without redoing this sum is how the pod
+    /// starts OOMKilling.
     pub max_concurrent_renders: usize,
     /// Salt folded into the `?v=` image hash.
     ///
@@ -41,6 +62,53 @@ pub struct Config {
     /// this to something that moves per deploy (the image tag) makes a visual
     /// change propagate. Defaults to the crate version.
     pub render_epoch: String,
+    /// Per-hop timeout for a link-preview fetch. A page that has not answered
+    /// in this long is not worth a card.
+    pub link_preview_timeout_secs: u64,
+    /// Whole-request budget for a link preview, spanning every redirect hop.
+    /// Must fit inside `router_timeout_secs`.
+    pub link_preview_deadline_secs: u64,
+    /// Hard cap on a previewed page body. The metadata lives in `<head>`, so
+    /// this is generous rather than tight.
+    pub link_preview_max_bytes: u64,
+    /// In-flight link-preview fetches. Route-scoped, for the reason
+    /// `build_router` gives.
+    pub max_concurrent_previews: usize,
+    /// How long a parsed preview is held, and the `max-age` the response
+    /// advertises — the browser and nginx cache for exactly as long as we do.
+    pub link_preview_cache_ttl_secs: u64,
+    /// Ceiling on the preview cache, in bytes. Byte-bounded rather than
+    /// entry-bounded because entry size varies by an order of magnitude, and
+    /// the figure that has to fit the pod's memory limit is bytes.
+    pub link_preview_cache_max_bytes: u64,
+    /// How long a robots.txt we successfully read stays good for. Only the
+    /// first preview per origin pays the round trip.
+    pub robots_cache_ttl_secs: u64,
+    /// Origins we hold robots.txt for. Small values, so this is bounded by
+    /// entries rather than bytes.
+    pub robots_cache_capacity: u64,
+    /// Shorter than the page timeout: robots.txt is small and sits in front of
+    /// the fetch a reader is waiting on, so it must not be able to spend the
+    /// whole deadline on its own.
+    pub robots_timeout_secs: u64,
+    /// Requests per window from traffic our own SPA originated. High enough
+    /// that a real user never meets it.
+    pub link_preview_rate_trusted: u32,
+    /// Requests per window from everything else.
+    pub link_preview_rate_untrusted: u32,
+    /// The fixed window both rates are counted over.
+    pub link_preview_rate_window_secs: u64,
+    /// How many entries to count back from the **right** of `X-Forwarded-For`
+    /// to find the address our own proxy wrote. Defaults to 2 — client ->
+    /// ingress -> the UI's nginx -> here. The leftmost entry is whatever the
+    /// client sent, so it is never read.
+    pub trusted_proxy_hops: usize,
+    /// Test seam, deliberately not configuration. `from_env` pins it false and
+    /// no environment variable reaches it, so no deployment can turn the
+    /// address guard off; integration tests set it by building `Config`
+    /// in-process to reach a loopback stub. Loopback only — every other
+    /// reserved range stays refused either way.
+    pub allow_loopback_preview_targets: bool,
     /// Directory with the bundled fonts.
     pub assets_dir: String,
     /// Must match a family in `assets_dir`. Not inferred from load order.
@@ -86,9 +154,51 @@ impl Config {
             avatar_max_bytes: parse("AVATAR_MAX_BYTES", 5 * 1024 * 1024),
             max_concurrent_renders: parse("MAX_CONCURRENT_RENDERS", 8),
             render_epoch: var("RENDER_EPOCH", env!("CARGO_PKG_VERSION")),
+            link_preview_timeout_secs: parse("LINK_PREVIEW_TIMEOUT_SECS", 3),
+            link_preview_deadline_secs: parse("LINK_PREVIEW_DEADLINE_SECS", 5),
+            link_preview_max_bytes: parse("LINK_PREVIEW_MAX_BYTES", 512_000),
+            max_concurrent_previews: parse("MAX_CONCURRENT_PREVIEWS", 16),
+            link_preview_cache_ttl_secs: parse("LINK_PREVIEW_CACHE_TTL_SECS", 86_400),
+            link_preview_cache_max_bytes: parse("LINK_PREVIEW_CACHE_MAX_BYTES", 16 * 1024 * 1024),
+            robots_cache_ttl_secs: parse("ROBOTS_CACHE_TTL_SECS", 86_400),
+            robots_cache_capacity: parse("ROBOTS_CACHE_CAPACITY", 4_096),
+            robots_timeout_secs: parse("ROBOTS_TIMEOUT_SECS", 2),
+            link_preview_rate_trusted: parse("LINK_PREVIEW_RATE_TRUSTED", 600),
+            link_preview_rate_untrusted: parse("LINK_PREVIEW_RATE_UNTRUSTED", 20),
+            link_preview_rate_window_secs: parse("LINK_PREVIEW_RATE_WINDOW_SECS", 60),
+            // Clamped, not just defaulted: 0 reads nothing and silently drops
+            // every caller into the shared peer bucket, which is the bug
+            // counting from the right exists to avoid.
+            trusted_proxy_hops: parse::<usize>("TRUSTED_PROXY_HOPS", 2).max(1),
+            allow_loopback_preview_targets: false,
             assets_dir: var("ASSETS_DIR", "assets"),
             font_family: var("FONT_FAMILY", "Figtree"),
         }
+    }
+
+    /// Whether reserved addresses are refused when previewing a link. Three
+    /// things read it: the pre-connect check, the resolver the fetching client
+    /// dials through, and `parse` — which judges `og:image` by the same ranges,
+    /// so an address we would not dial is not one we hand the browser.
+    ///
+    /// Here rather than in `link_preview` because `AppState::new` needs it to
+    /// build that client, before there is a state to ask.
+    pub fn reserved_policy(&self) -> crate::net::Reserved {
+        if self.allow_loopback_preview_targets {
+            crate::net::Reserved::AllowLoopback
+        } else {
+            crate::net::Reserved::Refuse
+        }
+    }
+
+    /// The router's whole-request budget. Card assembly and the avatar fetch
+    /// are sequential and separately bounded, so it has to cover both or the
+    /// timeout layer 504s a render that was going to succeed.
+    ///
+    /// Lives here rather than inline in `build_router` so the config tests can
+    /// assert other deadlines fit inside it without restating the formula.
+    pub fn router_timeout_secs(&self) -> u64 {
+        self.request_deadline_secs + self.avatar_timeout_secs + 2
     }
 }
 
@@ -110,5 +220,25 @@ mod tests {
         assert!(c.provisional_ttl_secs <= c.cache_ttl_secs);
         // The per-call timeout has to fit inside the whole-request budget.
         assert!(c.fetch_timeout_secs <= c.request_deadline_secs);
+        // Same for a link preview: per hop inside the request deadline, and
+        // that deadline inside the router's, or the 504 comes from the timeout
+        // layer with no Cache-Control instead of from the endpoint.
+        assert!(c.link_preview_timeout_secs <= c.link_preview_deadline_secs);
+        assert!(c.link_preview_deadline_secs < c.router_timeout_secs());
+        // Nothing in the environment may relax the address guard.
+        assert!(!c.allow_loopback_preview_targets);
+        // The two tiers only mean something if one is a ceiling and the other
+        // a throttle; equal rates would make the Sec-Fetch-Site check dead code.
+        assert!(c.link_preview_rate_untrusted < c.link_preview_rate_trusted);
+        assert!(c.link_preview_rate_window_secs > 0);
+        // Counting back zero hops reads nothing and silently falls through to
+        // the shared peer address, which is the bug this whole scheme exists
+        // to avoid.
+        assert!(c.trusted_proxy_hops >= 1);
+        // robots.txt is fetched before the page and inside the same deadline,
+        // so its timeout plus a page hop must still fit.
+        assert!(
+            c.robots_timeout_secs + c.link_preview_timeout_secs <= c.link_preview_deadline_secs
+        );
     }
 }

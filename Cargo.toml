@@ -45,6 +45,9 @@ serde_json = "1"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+lol_html = "3"
+encoding_rs = "0.8"
+html-escape = "0.2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
