@@ -273,6 +273,16 @@ async fn follow_and_read(st: &AppState, target: Url) -> Result<Option<Page>, Pre
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_string();
+    // Image hosts often serve pictures from extensionless URLs (m.stacker.news),
+    // which the UI cannot tell from a page. The headers can; the body is not read.
+    if is_image(&content_type) {
+        return Ok(Some(Page {
+            final_url: target,
+            content_type,
+            body: Vec::new(),
+            truncated: false,
+        }));
+    }
     if !is_html(&content_type) {
         return Err(PreviewError::NotHtml);
     }
@@ -380,13 +390,26 @@ async fn validate(st: &AppState, raw: &str) -> Result<Url, PreviewError> {
 
 /// `parse` needs `<head>` markup; anything else is not worth the bytes. A
 /// missing type is refused too — guessing is how you end up parsing a PDF.
-fn is_html(content_type: &str) -> bool {
-    let essence = content_type
+/// Formats every browser can draw. Other `image/*` (TIFF, HEIC) stay a 415:
+/// telling the UI "image" for something it cannot render is worse than no card.
+pub(crate) fn is_image(content_type: &str) -> bool {
+    matches!(
+        essence(content_type).as_str(),
+        "image/jpeg" | "image/png" | "image/gif" | "image/webp" | "image/avif"
+    )
+}
+
+fn essence(content_type: &str) -> String {
+    content_type
         .split(';')
         .next()
         .unwrap_or_default()
         .trim()
-        .to_ascii_lowercase();
+        .to_ascii_lowercase()
+}
+
+fn is_html(content_type: &str) -> bool {
+    let essence = essence(content_type);
     essence == "text/html" || essence == "application/xhtml+xml"
 }
 
@@ -448,6 +471,11 @@ mod tests {
         assert!(is_html("text/html; charset=utf-8"));
         assert!(is_html("TEXT/HTML;charset=ISO-8859-1"));
         assert!(is_html(" application/xhtml+xml "));
+        assert!(is_image("image/jpeg"));
+        assert!(is_image("IMAGE/PNG; q=1"));
+        assert!(!is_image("image/tiff"), "browsers cannot draw it");
+        assert!(!is_image("image/svg+xml"));
+        assert!(!is_image("application/pdf"));
         assert!(!is_html("text/plain"));
         assert!(!is_html("application/pdf"));
         assert!(!is_html("application/json"));

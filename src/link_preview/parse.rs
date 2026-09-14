@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use url::Url;
 
-use super::{find_head_end, Page, HEAD_FLOOR, SCHEMES};
+use super::{find_head_end, is_image, Page, HEAD_FLOOR, SCHEMES};
 use crate::net::{self, Reserved};
 
 /// Caps, in characters. Long enough for any honest page — the longest
@@ -58,12 +58,23 @@ fn wanted(key: &str) -> bool {
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Preview {
+    pub kind: Kind,
     pub title: Option<String>,
     pub description: Option<String>,
     pub image: Option<String>,
     pub site_name: Option<String>,
     /// The final URL, after redirects — not the one that was asked for.
     pub url: String,
+}
+
+/// What the link points at. An image link carries no markup to read, but the
+/// UI can still show the picture rather than a card naming its path.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    #[default]
+    Page,
+    Image,
 }
 
 impl Preview {
@@ -120,6 +131,16 @@ impl Tags {
 /// place the read did, so parsing stays bounded even if a caller hands over
 /// something larger.
 pub fn preview(page: &Page, reserved: Reserved) -> Preview {
+    if is_image(&page.content_type) {
+        return Preview {
+            kind: Kind::Image,
+            image: net::validate_url_with(page.final_url.as_str(), SCHEMES, reserved)
+                .ok()
+                .map(|u| u.to_string()),
+            url: page.final_url.to_string(),
+            ..Default::default()
+        };
+    }
     let html = decode(&page.content_type, &page.body[..head_cut(&page.body)]);
     let tags = scan(&html);
 
@@ -137,6 +158,7 @@ pub fn preview(page: &Page, reserved: Reserved) -> Preview {
         site_name: pick(tags.candidates(SITE_NAME), SITE_NAME_CAP)
             .or_else(|| host_label(&page.final_url)),
         url: page.final_url.to_string(),
+        kind: Kind::Page,
     };
     preview
 }
@@ -647,5 +669,6 @@ mod tests {
         assert!(json["image"].is_null());
         assert_eq!(json["siteName"], "example.com");
         assert_eq!(json["url"], "https://example.com/article");
+        assert_eq!(json["kind"], "page");
     }
 }

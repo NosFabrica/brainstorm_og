@@ -156,6 +156,24 @@ async fn stub_site() -> Stub {
             get(|| async { redirect("http://169.254.169.254/latest/meta-data/") }),
         )
         .route("/to-file", get(|| async { redirect("file:///etc/passwd") }))
+        .route(
+            "/pic",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "image/jpeg")],
+                    vec![0xFFu8, 0xD8, 0xFF],
+                )
+            }),
+        )
+        .route(
+            "/tiff",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "image/tiff")],
+                    vec![0x49u8, 0x49, 0x2A],
+                )
+            }),
+        )
         .route("/hop", get(|| async { redirect("/hop") }));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -619,4 +637,25 @@ fn our_own_layers_do_not_log_the_url_even_at_trace() {
     assert_nothing_leaked(&logs_from_three_previews(
         "brainstorm_og=trace,tower_http=trace",
     ));
+}
+
+#[tokio::test]
+async fn an_extensionless_image_is_an_image_not_a_refusal() {
+    // m.stacker.news/19886 serves image/jpeg with no extension; the UI cannot
+    // tell it from a page, so the answer has to say what it is.
+    let stub = stub_site().await;
+    let url = format!("{}/pic", stub.base);
+    let res = preview(&url).await;
+
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["data"]["kind"], "image");
+    assert_eq!(res.body["data"]["image"], url);
+    assert!(res.body["data"]["title"].is_null());
+}
+
+#[tokio::test]
+async fn an_image_browsers_cannot_draw_is_still_refused() {
+    let stub = stub_site().await;
+    let res = preview(&format!("{}/tiff", stub.base)).await;
+    assert_eq!(res.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
 }

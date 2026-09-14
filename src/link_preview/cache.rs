@@ -203,6 +203,7 @@ mod tests {
     #[test]
     fn the_weigher_counts_the_key_as_well_as_the_value() {
         let preview = Preview {
+            kind: Default::default(),
             title: Some("Title".into()),
             description: Some("Description".into()),
             image: None,
