@@ -59,7 +59,7 @@ brainstorm-og:
   depends_on: [brainstorm-server]
   environment:
     API_BASE_URL: http://brainstorm-server:8000
-    LOCAL_RELAY_URL: ws://strfry:7777
+    LOCAL_RELAY_URL: wss://search.brainstorm.world
     APP_BASE_URL: http://localhost:3000
 ```
 

@@ -46,18 +46,19 @@ nothing to clamp.
 `/overview` is still called, but only for the follower and following counts in
 the meta description. The `tier` bucket it returns is ignored.
 
-### Metadata comes from the relay, not Vespa
+### Metadata comes from the search relay
 
-One in-cluster relay, from config — not the original six-relay public fan-out,
+One relay, from config — not the original six-relay public fan-out,
 which is what produced a ~12s worst case, and not `nprofile` hints, which are
 attacker-supplied addresses. Hints are parsed (the TLV walk must step over them)
 and discarded.
 
-That relay is **neofry**, not strfry. neofry is the data ingress — the router
-streams kind 0 into it — while strfry is the read-only egress and is synced
-separately. Pointed at strfry on staging, every lookup returned "no kind-0
-event" and every card rendered a truncated npub instead of a name: the relay
-answered, it just had nothing.
+That relay is the shared search relay (`wss://search.brainstorm.world`), not
+in-cluster neofry or strfry: kind 0 is no longer synced into them. It refuses
+a read that names no lens, so the REQ carries `"search": "include:spam"`: plain
+recall, no ranking, nothing filtered. strfry rejects a `search` key outright,
+so the relay URL can't point back at it. A cache miss is a cross-cluster TLS
+round trip; the fetch timeout and fallback card still apply.
 
 ### The request `Host` header is never read
 
