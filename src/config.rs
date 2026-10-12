@@ -58,9 +58,10 @@ pub struct Config {
     ///
     /// The hash otherwise covers only the card's INPUTS, so a change to how the
     /// card is *drawn* produces identical URLs and never reaches anything that
-    /// already cached one — and those are served immutable for a year. Setting
-    /// this to something that moves per deploy (the image tag) makes a visual
-    /// change propagate. Defaults to the crate version.
+    /// already cached one — and those are served immutable for a year. Defaults
+    /// to the commit the binary was built from (`GIT_SHA` at build time, set by
+    /// CI), so it moves exactly when the renderer can have changed; crate version
+    /// for local builds. Set the env var only to force a re-render.
     pub render_epoch: String,
     /// Per-hop timeout for a link-preview fetch. A page that has not answered
     /// in this long is not worth a card.
@@ -115,6 +116,12 @@ pub struct Config {
     pub font_family: String,
 }
 
+/// The commit this binary was built from, or the crate version when built without `GIT_SHA`.
+const BUILD_EPOCH: &str = match option_env!("GIT_SHA") {
+    Some(sha) if !sha.is_empty() => sha,
+    _ => env!("CARGO_PKG_VERSION"),
+};
+
 fn var(key: &str, default: &str) -> String {
     env::var(key)
         .ok()
@@ -153,7 +160,7 @@ impl Config {
             request_deadline_secs: parse("REQUEST_DEADLINE_SECS", 4),
             avatar_max_bytes: parse("AVATAR_MAX_BYTES", 5 * 1024 * 1024),
             max_concurrent_renders: parse("MAX_CONCURRENT_RENDERS", 8),
-            render_epoch: var("RENDER_EPOCH", env!("CARGO_PKG_VERSION")),
+            render_epoch: var("RENDER_EPOCH", BUILD_EPOCH),
             link_preview_timeout_secs: parse("LINK_PREVIEW_TIMEOUT_SECS", 3),
             link_preview_deadline_secs: parse("LINK_PREVIEW_DEADLINE_SECS", 5),
             link_preview_max_bytes: parse("LINK_PREVIEW_MAX_BYTES", 512_000),

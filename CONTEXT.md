@@ -80,9 +80,10 @@ The hash also folds in `RENDER_EPOCH`, because a hash over inputs cannot express
 "the renderer changed". Without it a visual fix produces identical URLs and
 never reaches anything already holding one — and those are served immutable for
 a year. This bit us twice in one day: an avatar fix and the coin removal both
-left cached cards stale. The chart sets it from the Helm release revision, since
-staging rides a mutable image tag and a tag-derived value would be constant
-across exactly the deploys that most need to propagate.
+left cached cards stale. It defaults to the git commit the image was built from
+(CI passes `GIT_SHA`), so it moves exactly when the renderer can have changed and
+stays put across deploys that don't touch this image. The chart used to set it
+from the Helm release revision, which restarted the pod on every upgrade.
 
 Whatever the tagline eventually becomes, it must be **stable for a given card**
 or it desyncs from the hash.

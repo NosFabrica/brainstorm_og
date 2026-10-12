@@ -104,8 +104,8 @@ byte-identical image on every GrapeRank run.
 
 `RENDER_EPOCH` is the escape hatch for the opposite problem. A hash over inputs
 alone cannot express "the renderer changed", so a visual fix would produce
-identical URLs and never reach anything already holding one. The chart sets it
-from the Helm release revision, so each upgrade issues fresh URLs.
+identical URLs and never reach anything already holding one. It defaults to the
+git commit the image was built from, so each new image issues fresh URLs.
 
 This only helps crawlers that re-fetch the page — nothing forces Facebook to
 re-scrape. If a CDN is ever put in front that strips query strings from cache
@@ -174,7 +174,7 @@ container; the caches are in-memory, so restarting is what resets them.
 | `ROBOTS_CACHE_TTL_SECS` | `86400` | how long a read robots.txt is trusted |
 | `ROBOTS_CACHE_CAPACITY` | `4096` | origins whose robots.txt is held |
 | `ROBOTS_TIMEOUT_SECS` | `2` | robots.txt fetch; stays under the page timeout |
-| `RENDER_EPOCH` | crate version | salt for `?v=`; bump to force re-render |
+| `RENDER_EPOCH` | build commit (`GIT_SHA`), else crate version | salt for `?v=`; set to force re-render |
 | `MAX_CONCURRENT_RENDERS` | `32` | in-flight card renders; queues past this |
 | `ASSETS_DIR` | `assets` | bundled fonts |
 | `FONT_FAMILY` | `Figtree` | must match a family in `ASSETS_DIR` |

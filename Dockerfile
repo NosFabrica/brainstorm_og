@@ -20,8 +20,11 @@ RUN mkdir src \
 # nothing. The wordmark is `include_str!`d, so assets/ must be present to build.
 COPY assets ./assets
 COPY src ./src
+# Baked in as the default RENDER_EPOCH (see src/config.rs). Declared here, after
+# the dependency layer, so a new commit doesn't invalidate the dependency cache.
+ARG GIT_SHA=
 # Bust the stub's cached mtime so the real binary rebuilds.
-RUN touch src/main.rs src/lib.rs && cargo build --release --locked
+RUN touch src/main.rs src/lib.rs && GIT_SHA="$GIT_SHA" cargo build --release --locked
 
 # ---- runtime (scratch: static binary + assets + CA bundle) ----
 FROM scratch
