@@ -79,10 +79,11 @@ with a different audience and is free to look different.
 
 ## Data sources
 
-- **Metadata** (name/avatar/nip05): kind-0 from the in-cluster relay, and only
-  that one. Not a public fan-out — that is what made the original design slow —
-  and not Vespa, which is downstream of the relay via the redis ingest queue.
-  `nprofile` relay hints are parsed but never dialled.
+- **Metadata** (name/avatar/nip05): kind-0 from the shared search relay
+  (`wss://search.brainstorm.world`), and only that one. Not a public fan-out —
+  that is what made the original design slow. The REQ carries
+  `"search": "include:spam"`: the relay refuses a read naming no lens, and this
+  one is plain recall. `nprofile` relay hints are parsed but never dialled.
 - **Relationship counts**: one cached call to
   `GET {API_BASE_URL}/user/{hex}/overview`, used solely for the follower and
   following numbers in the meta description. The score it also returns is
@@ -150,7 +151,7 @@ container; the caches are in-memory, so restarting is what resets them.
 | `BIND_ADDR` | `0.0.0.0:8080` | |
 | `API_BASE_URL` | `http://brainstorm-server:8000` | overview stats |
 | `APP_BASE_URL` | `https://brainstorm.world` | **every** absolute URL we emit |
-| `LOCAL_RELAY_URL` | `ws://strfry:7777` | the only relay queried |
+| `LOCAL_RELAY_URL` | `wss://search.brainstorm.world` | the only relay queried; must accept NIP-50 `search` (strfry rejects it) |
 | `CACHE_MAX_ENTRIES` | `500` | card LRU size |
 | `CACHE_MAX_BYTES` | `67108864` (64 MB) | rendered-PNG LRU cap |
 | `CACHE_TTL_SECS` | `600` | origin re-render interval |
@@ -194,7 +195,6 @@ every card with no text at all.
 ```bash
 APP_BASE_URL=http://localhost:8080 \
 API_BASE_URL=https://brainstormserver-staging.nosfabrica.com \
-LOCAL_RELAY_URL=wss://purplepag.es \
 cargo run
 
 NPUB=npub1...

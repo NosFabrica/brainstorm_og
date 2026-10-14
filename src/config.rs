@@ -148,7 +148,7 @@ impl Config {
                 .trim_end_matches('/')
                 .to_string(),
             app_base_url,
-            local_relay_url: var("LOCAL_RELAY_URL", "ws://strfry:7777"),
+            local_relay_url: var("LOCAL_RELAY_URL", "wss://search.brainstorm.world"),
             card_cache_capacity: parse("CACHE_MAX_ENTRIES", 500),
             png_cache_max_bytes: parse("CACHE_MAX_BYTES", 64 * 1024 * 1024),
             cache_ttl_secs: parse("CACHE_TTL_SECS", 600),

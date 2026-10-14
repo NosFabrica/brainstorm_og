@@ -1,11 +1,12 @@
-//! Kind-0 metadata from the in-cluster relay.
+//! Kind-0 metadata from the search relay.
 //!
 //! One relay, from config — deliberately not a fan-out. The original design
 //! raced six public relays behind `nprofile` hints, which is what produced a
 //! ~12s worst case on a cache miss and dialled attacker-supplied addresses.
-//! A single in-cluster strfry is authoritative (Vespa is downstream of it),
-//! one network hop against LMDB, and carries no SSRF surface because the URL
-//! is ours, not the pointer's.
+//! Profiles come from the shared search relay (`wss://search.brainstorm.world`),
+//! which carries no SSRF surface because the URL is ours, not the pointer's.
+//! It refuses a read naming no lens, so the REQ carries `include:spam`: plain
+//! recall, no ranking, nothing filtered.
 
 use anyhow::{anyhow, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -33,7 +34,13 @@ pub async fn fetch_kind0(
 async fn fetch_inner(relay_url: &str, pubkey_hex: &str) -> Result<ProfileMeta> {
     let (mut ws, _) = tokio_tungstenite::connect_async(relay_url).await?;
 
-    let req = json!(["REQ", "og", { "authors": [pubkey_hex], "kinds": [0], "limit": 1 }]);
+    let filter = json!({
+        "authors": [pubkey_hex],
+        "kinds": [0],
+        "limit": 1,
+        "search": "include:spam",
+    });
+    let req = json!(["REQ", "og", filter]);
     ws.send(Message::Text(req.to_string().into())).await?;
 
     while let Some(msg) = ws.next().await {
