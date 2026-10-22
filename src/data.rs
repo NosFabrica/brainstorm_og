@@ -230,13 +230,15 @@ struct ShortUrlEnvelope {
 }
 #[derive(Deserialize)]
 struct ShortUrlData {
-    pubkey: String,
+    kind: String,
+    key: String,
 }
 
 /// Resolve a short code to its hex pubkey, or `None` if it doesn't resolve.
 ///
-/// `None` covers "no such code", "the API is unreachable" and "the API answered
-/// with something that isn't a pubkey". The caller must not invent a card in
+/// `None` covers "no such code", "the API is unreachable", "the code names
+/// something other than a profile" and "the API answered with something that
+/// isn't a pubkey". The caller must not invent a card in
 /// any of them: a preview claiming a profile that doesn't exist is worse than
 /// no preview.
 ///
@@ -290,7 +292,14 @@ async fn fetch_short_code(state: &AppState, key: &str) -> Result<String> {
     }
 
     let env: ShortUrlEnvelope = resp.json().await?;
-    let hex = env.data.pubkey.trim().to_lowercase();
+    if env.data.kind != "profile" {
+        tracing::debug!(
+            "short code {key} is a {} code, not a profile",
+            env.data.kind
+        );
+        anyhow::bail!("short code {key} is not a profile");
+    }
+    let hex = env.data.key.trim().to_lowercase();
     if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
         tracing::warn!("short code {key} resolved to a non-pubkey");
         anyhow::bail!("short code {key} resolved to a non-pubkey");
