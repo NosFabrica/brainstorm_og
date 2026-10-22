@@ -297,7 +297,7 @@ async fn fetch_short_code(state: &AppState, key: &str) -> Result<String> {
             "short code {key} is a {} code, not a profile",
             env.data.kind
         );
-        anyhow::bail!("short code {key} is not a profile");
+        anyhow::bail!("not a profile code");
     }
     let hex = env.data.key.trim().to_lowercase();
     if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {

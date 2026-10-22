@@ -26,7 +26,7 @@ direction), card (that's the share card).
 self-corrects rather than pinning a name-less card.
 
 **Short link / code**: `/s/{code}`, where the code stands in for an entity
-(`kind` + `key`, e.g. a profile's pubkey) plus relay hints. Only profile codes
+(`kind` + `key`, e.g. a profile's pubkey). Only profile codes
 get a card; any other kind is a 404. Say "code" for the identifier and "short link" for the URL — not
 "short url", which reads as either. Minted by `brainstorm_server`; immutable
 once minted, which is why resolution is cached without a TTL.
