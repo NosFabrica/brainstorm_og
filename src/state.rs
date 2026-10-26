@@ -25,8 +25,8 @@ pub struct AppState {
     pub preview_http: reqwest::Client,
     pub fontdb: Arc<fontdb::Database>,
     pub card_cache: Cache<String, Card>,
-    /// Short code -> hex pubkey. Immutable once minted, so no TTL.
-    pub short_code_cache: Cache<String, String>,
+    /// Short code -> hex pubkey, or `None` for a non-profile code. Immutable once minted, so no TTL.
+    pub short_code_cache: Cache<String, Option<String>>,
     pub png_cache: Cache<String, Bytes>,
     /// Fixed-window rate-limit counters for `/link-preview`, keyed by tier and
     /// client IP. Entries expire with the window.

@@ -23,7 +23,8 @@ the SPA's generic card rather than breaking anything.
 - `GET /s/{code}` → the same card for a **short share link**. The code is
   resolved to a pubkey via the API and cached; `og:url` and `canonical` point at
   `/p/`, since the card names the profile rather than the link to it. An
-  unresolvable code is a 404, never a card for a profile that doesn't exist.
+  unresolvable code, or one for a non-profile entity, is a 404, never a card
+  for a profile that doesn't exist.
   Registered under `/S/` too: the QR payload is uppercase, and nginx proxies the
   URI unchanged.
 - `GET /og/{id}.png?v={hash}` → 1200×630 PNG card.

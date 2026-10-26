@@ -26,6 +26,7 @@ use tower::ServiceExt;
 const HEX: &str = "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d";
 const APP: &str = "https://brainstorm.test";
 const CODE: &str = "AB3XK9QZ";
+const EVENT_CODE: &str = "EV3XK9QZ";
 
 /// A stand-in for `GET /shorturl/{code}`. Counts hits so caching is observable.
 async fn stub_api() -> (String, Arc<AtomicUsize>) {
@@ -39,10 +40,14 @@ async fn stub_api() -> (String, Arc<AtomicUsize>) {
                 let counter = counter.clone();
                 async move {
                     counter.fetch_add(1, Ordering::SeqCst);
-                    if code.to_uppercase() == CODE {
-                        Ok(Json(json!({ "data": { "pubkey": HEX, "relays": [] } })))
-                    } else {
-                        Err(StatusCode::NOT_FOUND)
+                    match code.to_uppercase().as_str() {
+                        CODE => Ok(Json(json!({ "data": {
+                            "kind": "profile", "key": HEX, "relays": [], "path": "/p/npub1x"
+                        } }))),
+                        EVENT_CODE => Ok(Json(json!({ "data": {
+                            "kind": "event", "key": HEX, "relays": [], "path": "/e/nevent1x"
+                        } }))),
+                        _ => Err(StatusCode::NOT_FOUND),
                     }
                 }
             },
@@ -123,6 +128,24 @@ async fn an_unknown_code_does_not_claim_a_profile() {
 
     assert_ne!(status, StatusCode::OK);
     assert!(!body.contains("og:title"), "invented a card: {body}");
+}
+
+#[tokio::test]
+async fn a_code_for_another_kind_of_entity_does_not_claim_a_profile() {
+    // Its key may be 64 hex (an event id), so the kind is what must decide.
+    let (api, hits) = stub_api().await;
+    let app = router(api);
+
+    for _ in 0..2 {
+        let (status, body) = get_on(&app, &format!("/s/{EVENT_CODE}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(!body.contains("og:title"), "invented a card: {body}");
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "not-a-profile answer not cached"
+    );
 }
 
 #[tokio::test]
