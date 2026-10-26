@@ -141,7 +141,11 @@ async fn a_code_for_another_kind_of_entity_does_not_claim_a_profile() {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(!body.contains("og:title"), "invented a card: {body}");
     }
-    assert_eq!(hits.load(Ordering::SeqCst), 1, "not-a-profile answer not cached");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "not-a-profile answer not cached"
+    );
 }
 
 #[tokio::test]
