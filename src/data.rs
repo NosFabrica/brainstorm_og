@@ -244,8 +244,8 @@ struct ShortUrlData {
 ///
 /// Cached without a TTL — a code's mapping is immutable once minted. The
 /// accepted consequence is that a code deleted upstream stays resolvable here
-/// until capacity evicts it. Failures are not cached, so a code minted after a
-/// crawler first tried it still resolves.
+/// until capacity evicts it. A non-profile code is cached as `None`; failures
+/// are not cached, so a code minted after a crawler first tried it still resolves.
 pub async fn resolve_short_code(state: &AppState, code: &str) -> Option<String> {
     let key = normalize_short_code(code);
     if key.is_empty() {
@@ -260,6 +260,7 @@ pub async fn resolve_short_code(state: &AppState, code: &str) -> Option<String> 
         .try_get_with(key.clone(), fetch_short_code(state, &key))
         .await
         .ok()
+        .flatten()
 }
 
 /// Match the server's folding (`normalize_short_code` in `shorturl_service.py`)
@@ -272,7 +273,7 @@ fn normalize_short_code(code: &str) -> String {
         .replace('O', "0")
 }
 
-async fn fetch_short_code(state: &AppState, key: &str) -> Result<String> {
+async fn fetch_short_code(state: &AppState, key: &str) -> Result<Option<String>> {
     let url = format!("{}/shorturl/{}", state.config.api_base_url, key);
     let resp = state
         .http
@@ -297,14 +298,14 @@ async fn fetch_short_code(state: &AppState, key: &str) -> Result<String> {
             "short code {key} is a {} code, not a profile",
             env.data.kind
         );
-        anyhow::bail!("not a profile code");
+        return Ok(None);
     }
     let hex = env.data.key.trim().to_lowercase();
     if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
         tracing::warn!("short code {key} resolved to a non-pubkey");
         anyhow::bail!("short code {key} resolved to a non-pubkey");
     }
-    Ok(hex)
+    Ok(Some(hex))
 }
 
 #[cfg(test)]
