@@ -1,6 +1,9 @@
+pub mod cards;
 pub mod config;
 pub mod data;
+pub mod event;
 pub mod link_preview;
+pub mod map;
 pub mod net;
 pub mod nip19;
 pub mod relay;
@@ -9,8 +12,13 @@ pub mod routes;
 pub mod state;
 
 use axum::{extract::Request, http::StatusCode, routing::get, Router};
+use std::sync::Arc;
 use std::time::Duration;
-use tower::{limit::ConcurrencyLimitLayer, ServiceBuilder};
+use tokio::sync::Semaphore;
+use tower::{
+    limit::{ConcurrencyLimitLayer, GlobalConcurrencyLimitLayer},
+    ServiceBuilder,
+};
 use tower_http::{catch_panic::CatchPanicLayer, timeout::TimeoutLayer, trace::TraceLayer};
 
 use crate::state::AppState;
@@ -22,7 +30,8 @@ pub const DEFAULT_LOG_FILTER: &str = "brainstorm_og=info,tower_http=warn";
 
 pub fn build_router(state: AppState) -> Router {
     let request_timeout = Duration::from_secs(state.config.router_timeout_secs());
-    let max_renders = state.config.max_concurrent_renders;
+    // One budget across both card routes: it is the memory bound (config.rs).
+    let renders = Arc::new(Semaphore::new(state.config.max_concurrent_renders));
     let max_previews = state.config.max_concurrent_previews;
 
     Router::new()
@@ -42,6 +51,9 @@ pub fn build_router(state: AppState) -> Router {
         // Short share links. Both cases, because nginx proxies the original URI
         // and the QR payload is uppercase (PRD D4b) — axum literal segments are
         // case-sensitive, so `/S/` needs its own route.
+        // Note/article/calendar/place cards. Same exact-segment rule as `/p/`.
+        .route("/e/{id}", get(routes::entity))
+        .route("/e/{id}/", get(routes::entity))
         .route("/s/{code}", get(routes::short_link))
         .route("/s/{code}/", get(routes::short_link))
         .route("/S/{code}", get(routes::short_link))
@@ -54,7 +66,13 @@ pub fn build_router(state: AppState) -> Router {
         // probe timing out under load turns slow cards into no service.
         .route(
             "/og/{id}",
-            get(routes::og_image).layer(ConcurrencyLimitLayer::new(max_renders)),
+            get(routes::og_image)
+                .layer(GlobalConcurrencyLimitLayer::with_semaphore(renders.clone())),
+        )
+        .route(
+            "/og/e/{id}",
+            get(routes::og_entity_image)
+                .layer(GlobalConcurrencyLimitLayer::with_semaphore(renders)),
         )
         // A third-party page, fetched because a human opened a note that links
         // to it. The inverse of an unfurl — see CONTEXT.md.

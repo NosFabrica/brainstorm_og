@@ -3,6 +3,8 @@
 
 #![allow(dead_code)]
 
+pub mod relay;
+
 use axum::Router;
 use brainstorm_og::{build_router, config::Config, state::AppState};
 
@@ -22,6 +24,7 @@ pub fn config() -> Config {
         image_cache_max_age: 31_536_000,
         provisional_ttl_secs: 5,
         fetch_timeout_secs: 1,
+        entity_retry_delay_ms: 10,
         avatar_timeout_secs: 1,
         request_deadline_secs: 2,
         avatar_max_bytes: 1024 * 1024,
@@ -29,6 +32,10 @@ pub fn config() -> Config {
         render_epoch: "test".into(),
         assets_dir: "assets".into(),
         font_family: "Figtree".into(),
+        place_concept: brainstorm_og::config::DEFAULT_PLACE_CONCEPT.into(),
+        tiles_base_url: "http://127.0.0.1:1".into(),
+        tiles_key: None,
+        tiles_timeout_secs: 1,
         link_preview_timeout_secs: 3,
         link_preview_deadline_secs: 5,
         link_preview_max_bytes: 64 * 1024,

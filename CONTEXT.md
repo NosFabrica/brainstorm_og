@@ -1,7 +1,7 @@
 # brainstorm-og
 
-Renders the share card and crawler-visible meta tags for `/p/{id}` and for the
-short share links `/s/{code}` resolve to. Replaces
+Renders the share card and crawler-visible meta tags for `/p/{id}`, `/e/{id}`
+and the short share links `/s/{code}` resolve to. Replaces
 `Brainstorm-UI`'s `useShareMeta.ts`, a client-side stopgap invisible to crawlers.
 
 Also serves **link previews**: reading someone else's page for a link posted in
@@ -10,8 +10,10 @@ service.
 
 ## Language
 
-**Share card**: the rendered 1200×630 image. _Avoid_: OG card, preview image —
-and not "link preview", which is a different thing below. "OG" survives only in
+**Share card**: the rendered 1200×630 image, one term for every kind. Qualify
+by entity: profile card, note card, article card, calendar event card, place
+card. _Avoid_: OG card, preview image, live preview, entity card — and not
+"link preview", which is a different thing below. "OG" survives only in
 protocol names (`og:image`, `/og/`).
 
 **Unfurl**: what a third-party crawler does with *our* share link. Inbound only.
@@ -25,9 +27,14 @@ direction), card (that's the share card).
 **Provisional card**: one assembled without a kind-0. Short TTL so it
 self-corrects rather than pinning a name-less card.
 
+**Skipped card**: no card is drawn for an entity (not found, nothing to draw,
+NSFW, deleted by its author, unsupported kind); the crawler gets 404 and falls
+back to the SPA's generic card. Counterpart of the provisional card.
+
 **Short link / code**: `/s/{code}`, where the code stands in for an entity
-(`kind` + `key`, e.g. a profile's pubkey). Only profile codes
-get a card; any other kind is a 404. Say "code" for the identifier and "short link" for the URL — not
+(`kind` + `key`, e.g. a profile's pubkey). `profile`, `event` and `address`
+codes get a card when the entity's kind is supported and it isn't skipped;
+`hashtag` and `tag` codes are 404. Say "code" for the identifier and "short link" for the URL — not
 "short url", which reads as either. Minted by `brainstorm_server`; immutable
 once minted, which is why resolution is cached without a TTL.
 
@@ -153,6 +160,24 @@ that next to Neo4j, Postgres and Redis credentials.
 Not taken: reading previews from the note itself. NIP-92 `imeta` could carry
 Open Graph fields so no one fetches anything (nips PR #1674), but it has been
 dormant since March 2025 and almost no notes carry it.
+
+### The map is drawn here from vector tiles
+
+The place card's map is rasterised by this service: the z14 vector tiles under
+the panel, fetched from the cluster's tiles server, drawn with tiny-skia in
+Positron's colours at zoom 15 with our pin on top. The tiles server serves
+vectors only, and the alternative, a raster sidecar (tileserver-gl,
+maplibre-native), is a heavy GL image and another service to run for one
+panel per card.
+
+What that costs is labels: no glyph placement, so no street or place names on
+the map. The address is printed beside it, which is what a reader needs.
+
+The tiles come through their own client with the server key
+(`X-NF-Tiles-Key`), never the link-preview client: the tiles server is ours and
+in-cluster, and the preview client's address guard must keep refusing cluster
+addresses. A tile that fails, or coordinates that aren't valid, give a card
+without the map rather than no card.
 
 ### We identify honestly and never impersonate
 

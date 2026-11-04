@@ -21,6 +21,8 @@ pub struct Config {
     /// TTL for provisional cards, so they self-correct quickly.
     pub provisional_ttl_secs: u64,
     pub fetch_timeout_secs: u64,
+    /// Pause before re-reading an entity the relay lacked: the first crawler hit often lands seconds after posting.
+    pub entity_retry_delay_ms: u64,
     pub avatar_timeout_secs: u64,
     /// Whole-request budget for gathering card data. Crawlers give up at 5-10s.
     pub request_deadline_secs: u64,
@@ -40,9 +42,12 @@ pub struct Config {
     ///
     ///   8 renders x 32 MB decode ceiling ...... 256 MB  (bound, not typical)
     ///   16 previews x 512 KB body cap .........   8 MB
-    ///   cache ceilings (64 png + 16 preview) ..  82 MB
+    ///   cache ceilings (64 png + 16 preview
+    ///     + 16 map tiles) .....................  98 MB
     ///   runtime floor .........................  25 MB
-    ///                                    peak  ~ 371 MB of 512Mi
+    ///                                    peak  ~ 387 MB of 512Mi
+    ///
+    /// Fonts (~22 MB) are file-mapped once, shared by resvg and measuring.
     ///
     /// The 32 MB is a decode ceiling reached only by a maximal source image:
     /// eight concurrent renders with no avatar moved measured RSS by nothing.
@@ -114,7 +119,19 @@ pub struct Config {
     pub assets_dir: String,
     /// Must match a family in `assets_dir`. Not inferred from load order.
     pub font_family: String,
+    /// DList items whose `z` is this coordinate get a place card.
+    pub place_concept: String,
+    /// The tiles server the place map is drawn from, no trailing slash. In-cluster in the chart.
+    pub tiles_base_url: String,
+    /// Sent as `X-NF-Tiles-Key`. Without it we send our own `Origin`, which is rate-limited.
+    pub tiles_key: Option<String>,
+    /// Whole budget for a map's tiles.
+    pub tiles_timeout_secs: u64,
 }
+
+/// The UI's `views.place` (`dictionary.config.json`).
+pub const DEFAULT_PLACE_CONCEPT: &str =
+    "39998:b83a28b7e4e5d20bd960c5faeb6625f95529166b8bdb045d42634a2f35919450:food-and-drink-places";
 
 /// The commit this binary was built from, or the crate version when built without `GIT_SHA`.
 const BUILD_EPOCH: &str = match option_env!("GIT_SHA") {
@@ -155,7 +172,8 @@ impl Config {
             html_cache_max_age: parse("HTML_CACHE_MAX_AGE", 300),
             image_cache_max_age: parse("IMAGE_CACHE_MAX_AGE", 31_536_000),
             provisional_ttl_secs: parse("PROVISIONAL_TTL_SECS", 60),
-            fetch_timeout_secs: parse("FETCH_TIMEOUT_SECS", 3),
+            fetch_timeout_secs: parse("FETCH_TIMEOUT_SECS", 4),
+            entity_retry_delay_ms: parse("ENTITY_RETRY_DELAY_MS", 1500),
             avatar_timeout_secs: parse("AVATAR_TIMEOUT_SECS", 5),
             request_deadline_secs: parse("REQUEST_DEADLINE_SECS", 4),
             avatar_max_bytes: parse("AVATAR_MAX_BYTES", 5 * 1024 * 1024),
@@ -180,6 +198,15 @@ impl Config {
             allow_loopback_preview_targets: false,
             assets_dir: var("ASSETS_DIR", "assets"),
             font_family: var("FONT_FAMILY", "Figtree"),
+            place_concept: var("PLACE_CONCEPT", DEFAULT_PLACE_CONCEPT),
+            tiles_base_url: var(
+                "TILES_BASE_URL",
+                "https://map-tiles-server.brainstorm.world",
+            )
+            .trim_end_matches('/')
+            .to_string(),
+            tiles_key: env::var("TILES_KEY").ok().filter(|s| !s.is_empty()),
+            tiles_timeout_secs: parse("TILES_TIMEOUT_SECS", 5),
         }
     }
 
@@ -205,7 +232,15 @@ impl Config {
     /// Lives here rather than inline in `build_router` so the config tests can
     /// assert other deadlines fit inside it without restating the formula.
     pub fn router_timeout_secs(&self) -> u64 {
-        self.request_deadline_secs + self.avatar_timeout_secs + 2
+        let visual = self.avatar_timeout_secs.max(self.tiles_timeout_secs);
+        self.entity_deadline().as_secs_f64().ceil() as u64 + visual + 2
+    }
+
+    /// Entity card worst case: read, pause, re-read, then the delete and author reads side by side.
+    pub fn entity_deadline(&self) -> std::time::Duration {
+        let read = std::time::Duration::from_secs(self.fetch_timeout_secs);
+        let follow_up = read.max(std::time::Duration::from_secs(self.request_deadline_secs));
+        read * 2 + std::time::Duration::from_millis(self.entity_retry_delay_ms) + follow_up
     }
 }
 
@@ -220,6 +255,7 @@ mod tests {
         // emitted URL gets a double one.
         assert!(!c.app_base_url.ends_with('/'));
         assert!(!c.api_base_url.ends_with('/'));
+        assert!(!c.tiles_base_url.ends_with('/'));
         // The HTML must expire long before the image it points at, or a
         // changed `?v=` would never be advertised.
         assert!(c.html_cache_max_age < c.image_cache_max_age);

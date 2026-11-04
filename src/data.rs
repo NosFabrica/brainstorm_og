@@ -234,19 +234,27 @@ struct ShortUrlData {
     key: String,
 }
 
-/// Resolve a short code to its hex pubkey, or `None` if it doesn't resolve.
+/// What a short code names, as far as og cares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShortTarget {
+    Profile(String),
+    Entity(crate::nip19::Entity),
+    /// A hashtag or tag code: no card.
+    Other,
+}
+
+/// Resolve a short code, or `None` if it doesn't resolve.
 ///
-/// `None` covers "no such code", "the API is unreachable", "the code names
-/// something other than a profile" and "the API answered with something that
-/// isn't a pubkey". The caller must not invent a card in
-/// any of them: a preview claiming a profile that doesn't exist is worse than
-/// no preview.
+/// `None` covers "no such code", "the API is unreachable" and "the API
+/// answered with a key that doesn't fit its kind". The caller must not invent
+/// a card in any of them: a preview claiming something that doesn't exist is
+/// worse than no preview.
 ///
 /// Cached without a TTL — a code's mapping is immutable once minted. The
 /// accepted consequence is that a code deleted upstream stays resolvable here
-/// until capacity evicts it. A non-profile code is cached as `None`; failures
-/// are not cached, so a code minted after a crawler first tried it still resolves.
-pub async fn resolve_short_code(state: &AppState, code: &str) -> Option<String> {
+/// until capacity evicts it. Failures are not cached, so a code minted after a
+/// crawler first tried it still resolves.
+pub async fn resolve_short_code(state: &AppState, code: &str) -> Option<ShortTarget> {
     let key = normalize_short_code(code);
     if key.is_empty() {
         return None;
@@ -260,7 +268,6 @@ pub async fn resolve_short_code(state: &AppState, code: &str) -> Option<String> 
         .try_get_with(key.clone(), fetch_short_code(state, &key))
         .await
         .ok()
-        .flatten()
 }
 
 /// Match the server's folding (`normalize_short_code` in `shorturl_service.py`)
@@ -273,7 +280,7 @@ fn normalize_short_code(code: &str) -> String {
         .replace('O', "0")
 }
 
-async fn fetch_short_code(state: &AppState, key: &str) -> Result<Option<String>> {
+async fn fetch_short_code(state: &AppState, key: &str) -> Result<ShortTarget> {
     let url = format!("{}/shorturl/{}", state.config.api_base_url, key);
     let resp = state
         .http
@@ -293,19 +300,39 @@ async fn fetch_short_code(state: &AppState, key: &str) -> Result<Option<String>>
     }
 
     let env: ShortUrlEnvelope = resp.json().await?;
-    if env.data.kind != "profile" {
-        tracing::debug!(
-            "short code {key} is a {} code, not a profile",
+    let target = short_target(&env.data.kind, &env.data.key);
+    if target.is_none() {
+        tracing::warn!(
+            "short code {key} resolved to a malformed {} key",
             env.data.kind
         );
-        return Ok(None);
     }
-    let hex = env.data.key.trim().to_lowercase();
-    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-        tracing::warn!("short code {key} resolved to a non-pubkey");
-        anyhow::bail!("short code {key} resolved to a non-pubkey");
+    target.ok_or_else(|| anyhow::anyhow!("short code {key} resolved to a malformed key"))
+}
+
+/// The server's stored key forms: hex pubkey, hex event id, `kind:pubkey:d`.
+fn short_target(kind: &str, key: &str) -> Option<ShortTarget> {
+    use crate::nip19::Entity;
+    let key = key.trim();
+    match kind {
+        "profile" => crate::nip19::is_hex64(key).then(|| ShortTarget::Profile(key.to_lowercase())),
+        "event" => crate::nip19::is_hex64(key).then(|| {
+            ShortTarget::Entity(Entity::Event {
+                id: key.to_lowercase(),
+            })
+        }),
+        "address" => {
+            let mut parts = key.splitn(3, ':');
+            let kind = parts.next()?.parse().ok()?;
+            let pubkey = parts
+                .next()
+                .filter(|p| crate::nip19::is_hex64(p))?
+                .to_lowercase();
+            let d = parts.next()?.to_string();
+            Some(ShortTarget::Entity(Entity::Address { kind, pubkey, d }))
+        }
+        _ => Some(ShortTarget::Other),
     }
-    Ok(Some(hex))
 }
 
 #[cfg(test)]
