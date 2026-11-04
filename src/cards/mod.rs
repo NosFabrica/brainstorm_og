@@ -60,10 +60,20 @@ pub struct ImageRequest {
     pub height: u32,
 }
 
-/// A body's one picture, fetched as an image.
+/// A map centred on a point, drawn from vector tiles instead of fetched as an image.
+#[derive(Debug, Clone, Copy)]
+pub struct MapRequest {
+    pub lat: f64,
+    pub lon: f64,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// A body's one picture: fetched, or drawn from vector tiles.
 #[derive(Debug, Clone)]
 pub enum Visual {
     Image(ImageRequest),
+    Map(MapRequest),
 }
 
 /// Everything a body needs to draw its content area.

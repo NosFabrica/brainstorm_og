@@ -161,6 +161,24 @@ Not taken: reading previews from the note itself. NIP-92 `imeta` could carry
 Open Graph fields so no one fetches anything (nips PR #1674), but it has been
 dormant since March 2025 and almost no notes carry it.
 
+### The map is drawn here from vector tiles
+
+The place card's map is rasterised by this service: the z14 vector tiles under
+the panel, fetched from the cluster's tiles server, drawn with tiny-skia in
+Positron's colours at zoom 15 with our pin on top. The tiles server serves
+vectors only, and the alternative, a raster sidecar (tileserver-gl,
+maplibre-native), is a heavy GL image and another service to run for one
+panel per card.
+
+What that costs is labels: no glyph placement, so no street or place names on
+the map. The address is printed beside it, which is what a reader needs.
+
+The tiles come through their own client with the server key
+(`X-NF-Tiles-Key`), never the link-preview client: the tiles server is ours and
+in-cluster, and the preview client's address guard must keep refusing cluster
+addresses. A tile that fails, or coordinates that aren't valid, give a card
+without the map rather than no card.
+
 ### We identify honestly and never impersonate
 
 `BrainstormBot/1.0 (+https://brainstorm.world/bot)`, always. Some sites serve

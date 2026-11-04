@@ -23,6 +23,10 @@ pub struct AppState {
     /// unlike `avatar_http`, a resolver that refuses reserved addresses at
     /// resolution time rather than only before the connection.
     pub preview_http: reqwest::Client,
+    /// The tiles server only: ours, from config, so redirects are refused and nothing else is dialled.
+    pub tiles_http: reqwest::Client,
+    /// Raw tile bodies as served (gzip). A tile changes only with the monthly build.
+    pub tile_cache: Cache<crate::map::TileId, Bytes>,
     pub fontdb: Arc<fontdb::Database>,
     /// Bundled faces, for measuring text before layout.
     pub metrics: Arc<crate::render::Metrics>,
@@ -101,6 +105,13 @@ impl AppState {
             .build()
             .context("building link preview client")?;
 
+        let tiles_http = reqwest::Client::builder()
+            .user_agent("brainstorm-og/0.1")
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("building tiles client")?;
+        let tile_cache = crate::map::tile_cache();
+
         let ttl = Duration::from_secs(config.cache_ttl_secs);
         let card_cache = Cache::builder()
             .max_capacity(config.card_cache_capacity)
@@ -147,6 +158,8 @@ impl AppState {
             http,
             avatar_http,
             preview_http,
+            tiles_http,
+            tile_cache,
             fontdb: Arc::new(db),
             metrics: Arc::new(metrics),
             card_cache,

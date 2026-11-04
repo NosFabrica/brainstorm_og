@@ -86,6 +86,7 @@ pub async fn render_entity(state: &AppState, card: &EntityCard) -> Result<Vec<u8
         fetch_optional(state, picture, STRIP_AV as u32, STRIP_AV as u32),
         async {
             match built.body.visual() {
+                Some(Visual::Map(m)) => crate::map::draw(state, m).await,
                 Some(Visual::Image(r)) => {
                     fetch_optional(state, Some(&r.url), r.width, r.height).await
                 }

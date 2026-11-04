@@ -139,3 +139,73 @@ async fn a_9999_item_by_nevent_gets_the_card() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(meta(&body, "og:title"), "Coque");
 }
+
+/// A tiles server answering every tile with `status` and the Sedgefield fixture, recording the key it was sent.
+async fn stub_tiles(
+    status: u16,
+) -> (
+    String,
+    std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+) {
+    use axum::http::HeaderMap;
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>> = Default::default();
+    let s = seen.clone();
+    let app = Router::new().route(
+        "/planet/{z}/{x}/{y}",
+        axum::routing::get(move |headers: HeaderMap| {
+            let s = s.clone();
+            async move {
+                let key = headers
+                    .get("x-nf-tiles-key")
+                    .map(|v| v.to_str().unwrap().to_string());
+                s.lock().unwrap().push(key);
+                (
+                    StatusCode::from_u16(status).unwrap(),
+                    include_bytes!("../src/map/testdata/14-9228-9839.mvt").as_slice(),
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (url, seen)
+}
+
+/// Brightness inside the card's map panel, clear of its rounded corner and the pin.
+async fn panel_brightness(tiles: &str) -> u32 {
+    let relay = StubRelay::start(vec![coque(PLACES)]).await;
+    let app = common::router_with(Config {
+        local_relay_url: relay.url.clone(),
+        tiles_base_url: tiles.into(),
+        tiles_key: Some("sekrit".into()),
+        ..common::config()
+    });
+    let (status, _, bytes) = get_on(&app, &format!("/og/e/{}.png?v=x", naddr())).await;
+    assert_eq!(status, StatusCode::OK);
+    let img = image::load_from_memory(&bytes).unwrap().to_rgb8();
+    img.get_pixel(760, 220)
+        .0
+        .iter()
+        .map(|&c| u32::from(c))
+        .sum::<u32>()
+        / 3
+}
+
+#[tokio::test]
+async fn a_place_with_coordinates_gets_a_map_from_the_tiles_server() {
+    let (tiles, seen) = stub_tiles(200).await;
+    assert!(panel_brightness(&tiles).await > 150);
+    let seen = seen.lock().unwrap();
+    assert!(!seen.is_empty());
+    assert!(seen.iter().all(|k| k.as_deref() == Some("sekrit")));
+}
+
+#[tokio::test]
+async fn a_failing_tiles_server_leaves_the_card_without_a_map() {
+    let (tiles, _) = stub_tiles(500).await;
+    assert!(panel_brightness(&tiles).await < 60);
+    assert!(panel_brightness("http://127.0.0.1:1").await < 60);
+}

@@ -193,6 +193,9 @@ container; the caches are in-memory, so restarting is what resets them.
 | `ASSETS_DIR` | `assets` | bundled fonts |
 | `FONT_FAMILY` | `Figtree` | must match a family in `ASSETS_DIR` |
 | `PLACE_CONCEPT` | UI's `views.place` (`39998:b83a…:food-and-drink-places`) | DList items (39999/9999) with this `z` get a place card |
+| `TILES_BASE_URL` | `https://map-tiles-server.brainstorm.world` | tiles server the place map is drawn from; the chart points it in-cluster |
+| `TILES_KEY` | unset | sent as `X-NF-Tiles-Key`; unset sends `Origin: APP_BASE_URL` instead (rate-limited) |
+| `TILES_TIMEOUT_SECS` | `5` | whole budget for a place map's tiles; past it the card has no map |
 
 `APP_BASE_URL` is the whole story for URL generation: the request's `Host`
 header is never read. A forged `Host: evil.com` therefore cannot put an attacker

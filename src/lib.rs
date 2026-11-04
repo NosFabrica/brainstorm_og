@@ -3,6 +3,7 @@ pub mod config;
 pub mod data;
 pub mod event;
 pub mod link_preview;
+pub mod map;
 pub mod net;
 pub mod nip19;
 pub mod relay;

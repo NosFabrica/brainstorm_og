@@ -42,10 +42,11 @@ pub struct Config {
     ///
     ///   8 renders x 32 MB decode ceiling ...... 256 MB  (bound, not typical)
     ///   16 previews x 512 KB body cap .........   8 MB
-    ///   cache ceilings (64 png + 16 preview) ..  82 MB
+    ///   cache ceilings (64 png + 16 preview
+    ///     + 16 map tiles) .....................  98 MB
     ///   runtime floor .........................  25 MB
     ///   font copies for measuring .............  20 MB
-    ///                                    peak  ~ 391 MB of 512Mi
+    ///                                    peak  ~ 407 MB of 512Mi
     ///
     /// The 32 MB is a decode ceiling reached only by a maximal source image:
     /// eight concurrent renders with no avatar moved measured RSS by nothing.
@@ -119,6 +120,12 @@ pub struct Config {
     pub font_family: String,
     /// DList items whose `z` is this coordinate get a place card.
     pub place_concept: String,
+    /// The tiles server the place map is drawn from, no trailing slash. In-cluster in the chart.
+    pub tiles_base_url: String,
+    /// Sent as `X-NF-Tiles-Key`. Without it we send our own `Origin`, which is rate-limited.
+    pub tiles_key: Option<String>,
+    /// Whole budget for a map's tiles.
+    pub tiles_timeout_secs: u64,
 }
 
 /// The UI's `views.place` (`dictionary.config.json`).
@@ -191,6 +198,14 @@ impl Config {
             assets_dir: var("ASSETS_DIR", "assets"),
             font_family: var("FONT_FAMILY", "Figtree"),
             place_concept: var("PLACE_CONCEPT", DEFAULT_PLACE_CONCEPT),
+            tiles_base_url: var(
+                "TILES_BASE_URL",
+                "https://map-tiles-server.brainstorm.world",
+            )
+            .trim_end_matches('/')
+            .to_string(),
+            tiles_key: env::var("TILES_KEY").ok().filter(|s| !s.is_empty()),
+            tiles_timeout_secs: parse("TILES_TIMEOUT_SECS", 5),
         }
     }
 
@@ -216,7 +231,8 @@ impl Config {
     /// Lives here rather than inline in `build_router` so the config tests can
     /// assert other deadlines fit inside it without restating the formula.
     pub fn router_timeout_secs(&self) -> u64 {
-        self.entity_deadline().as_secs_f64().ceil() as u64 + self.avatar_timeout_secs + 2
+        let visual = self.avatar_timeout_secs.max(self.tiles_timeout_secs);
+        self.entity_deadline().as_secs_f64().ceil() as u64 + visual + 2
     }
 
     /// Entity card worst case: read, pause, re-read, then the delete and author reads side by side.
@@ -238,6 +254,7 @@ mod tests {
         // emitted URL gets a double one.
         assert!(!c.app_base_url.ends_with('/'));
         assert!(!c.api_base_url.ends_with('/'));
+        assert!(!c.tiles_base_url.ends_with('/'));
         // The HTML must expire long before the image it points at, or a
         // changed `?v=` would never be advertised.
         assert!(c.html_cache_max_age < c.image_cache_max_age);

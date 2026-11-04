@@ -4,9 +4,9 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::Hash;
 use std::sync::Arc;
 
-use super::{fit, Body, Built, DrawCx, ImageRequest, Meta, Skip, Visual};
+use super::{fit, Body, Built, DrawCx, ImageRequest, MapRequest, Meta, Skip, Visual};
 use crate::event::Event;
-use crate::render::{self, ACCENT, INK, MUTED};
+use crate::render::{self, esc, ACCENT, INK, MUTED, PRIMARY};
 use crate::state::AppState;
 
 const NAME_SIZES: [f32; 6] = [72.0, 64.0, 58.0, 52.0, 48.0, 44.0];
@@ -23,10 +23,20 @@ pub const PANEL_H: f32 = render::CONTENT_BOTTOM_NO_AUTHOR - render::CONTENT_TOP;
 pub const PANEL_X: f32 = render::CONTENT_X + render::CONTENT_W - PANEL_W;
 const PANEL_R: f32 = 24.0;
 
-/// The card's one visual: the item's image.
-#[derive(Debug, Clone, Hash, PartialEq)]
+/// The card's one visual: the map whenever coordinates are valid, else the item's image.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Panel {
+    Map { lat: f64, lon: f64 },
     Image(String),
+}
+
+impl Hash for Panel {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        match self {
+            Panel::Map { lat, lon } => (0u8, lat.to_bits(), lon.to_bits()).hash(h),
+            Panel::Image(url) => (1u8, url).hash(h),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Hash, PartialEq)]
@@ -46,6 +56,12 @@ impl Body for Place {
     fn visual(&self) -> Option<Visual> {
         let (width, height) = (PANEL_W as u32, PANEL_H as u32);
         Some(match self.panel.as_ref()? {
+            Panel::Map { lat, lon } => Visual::Map(MapRequest {
+                lat: *lat,
+                lon: *lon,
+                width,
+                height,
+            }),
             Panel::Image(url) => Visual::Image(ImageRequest {
                 url: url.clone(),
                 width,
@@ -63,6 +79,9 @@ impl Body for Place {
         let mut out = self.text_svg(cx, width);
         if let Some(p) = panel {
             out.push_str(&p);
+            if matches!(self.panel, Some(Panel::Map { .. })) {
+                out.push_str(&map_marks(cx));
+            }
         }
         out
     }
@@ -121,6 +140,29 @@ fn panel_svg(png: &[u8]) -> String {
     render::embed_png("place-panel", x, y, PANEL_W, PANEL_H, PANEL_R, png)
 }
 
+const CREDIT: &str = "© OpenStreetMap contributors · OpenFreeMap";
+const CREDIT_SIZE: f32 = 13.0;
+
+/// The UI's `PlaceMap` pin, tip on the panel's centre (the map is centred on the place), and the credit.
+fn map_marks(cx: &DrawCx) -> String {
+    let (cx_, cy) = (PANEL_X + PANEL_W / 2.0, render::CONTENT_TOP + PANEL_H / 2.0);
+    let (px, py) = (cx_ - 17.0, cy - 41.0);
+    let tw = (cx.measure)(CREDIT, CREDIT_SIZE, 400);
+    let (bw, bh) = (tw + 16.0, CREDIT_SIZE + 10.0);
+    let bx = PANEL_X + PANEL_W - bw - 12.0;
+    let by = render::CONTENT_TOP + PANEL_H - bh - 12.0;
+    format!(
+        r##"<g id="place-pin" transform="translate({px} {py})"><path d="M17 41c-1 0-15-16-15-24a15 15 0 1 1 30 0c0 8-14 24-15 24Z" fill="{PRIMARY}" stroke="#fff" stroke-width="2"/><circle cx="17" cy="17" r="5.5" fill="#fff"/></g>
+<rect x="{bx}" y="{by}" width="{bw}" height="{bh}" rx="{r}" fill="#ffffff" fill-opacity="0.8"/>
+<text x="{tx}" y="{ty}" font-family="{family}" font-size="{CREDIT_SIZE}" fill="#4b5563">{credit}</text>"##,
+        r = bh / 2.0,
+        tx = bx + 8.0,
+        ty = by + bh / 2.0 + CREDIT_SIZE * 0.35,
+        family = esc(cx.family),
+        credit = esc(CREDIT),
+    )
+}
+
 pub async fn build(st: &AppState, ev: &Event) -> Result<Built, Skip> {
     let (place, meta) = read(ev, &st.config.place_concept)?;
     Ok(Built {
@@ -156,9 +198,13 @@ pub fn read(ev: &Event, concept: &str) -> Result<(Place, Meta), Skip> {
         country: field("country"),
     });
 
-    let panel = field("image")
-        .and_then(|u| super::web_url(&u))
-        .map(Panel::Image);
+    let panel = coords(field("lat"), field("lon"))
+        .map(|(lat, lon)| Panel::Map { lat, lon })
+        .or_else(|| {
+            field("image")
+                .and_then(|u| super::web_url(&u))
+                .map(Panel::Image)
+        });
 
     let meta = Meta {
         title: name.clone(),
@@ -175,6 +221,14 @@ pub fn read(ev: &Event, concept: &str) -> Result<(Place, Meta), Skip> {
         },
         meta,
     ))
+}
+
+/// Inside Web Mercator's range; null island is a missing value, not a place.
+fn coords(lat: Option<String>, lon: Option<String>) -> Option<(f64, f64)> {
+    let lat: f64 = lat?.parse().ok()?;
+    let lon: f64 = lon?.parse().ok()?;
+    let ok = lat.abs() <= crate::map::MAX_LAT && lon.abs() <= 180.0 && (lat, lon) != (0.0, 0.0);
+    ok.then_some((lat, lon))
 }
 
 fn join(parts: &[Option<String>], sep: &str) -> Option<String> {
@@ -299,6 +353,42 @@ mod tests {
     }
 
     #[test]
+    fn coordinates_put_the_map_in_the_panel() {
+        let (p, _) = read(&fanshop(), PLACES).unwrap();
+        assert_eq!(
+            p.panel,
+            Some(Panel::Map {
+                lat: 48.388067,
+                lon: 9.9871421
+            })
+        );
+    }
+
+    #[test]
+    fn bad_coordinates_fall_back_to_the_image() {
+        let img = "https://ratiopharmulm.com/wp-content/uploads/2022/05/Bild3.jpg";
+        for (lat, lon) in [
+            ("91", "9"),
+            ("48", "181"),
+            ("NaN", "9"),
+            ("48", ""),
+            ("0", "0"),
+            ("86", "9"),
+        ] {
+            let mut ev = fanshop();
+            for t in ev.tags.iter_mut() {
+                match t[0].as_str() {
+                    "lat" => t[1] = lat.into(),
+                    "lon" => t[1] = lon.into(),
+                    _ => {}
+                }
+            }
+            let panel = read(&ev, PLACES).unwrap().0.panel;
+            assert_eq!(panel, Some(Panel::Image(img.into())), "{lat},{lon}");
+        }
+    }
+
+    #[test]
     fn reads_a_real_item() {
         let (p, meta) = read(&fanshop(), PLACES).unwrap();
         assert_eq!(meta.title, "FanShop OrangeCampus");
@@ -310,9 +400,10 @@ mod tests {
                 name: "FanShop OrangeCampus".into(),
                 kind: Some("Cafe · Coffee shop".into()),
                 address: vec!["37 Wiblinger Straße".into(), "Neu-Ulm, 89231, DE".into()],
-                panel: Some(Panel::Image(
-                    "https://ratiopharmulm.com/wp-content/uploads/2022/05/Bild3.jpg".into()
-                )),
+                panel: Some(Panel::Map {
+                    lat: 48.388067,
+                    lon: 9.9871421
+                }),
             }
         );
     }
@@ -423,6 +514,13 @@ mod tests {
         assert_ne!(v, change(&|p| p.kind = None));
         assert_ne!(v, change(&|p| p.address.pop().map(drop).unwrap_or(())));
         assert_ne!(v, change(&|p| p.panel = None));
+        assert_ne!(
+            v,
+            change(&|p| p.panel = Some(Panel::Map {
+                lat: 48.388068,
+                lon: 9.9871421
+            }))
+        );
     }
 
     fn draw(p: &Place, image: Option<&[u8]>) -> String {
@@ -437,13 +535,28 @@ mod tests {
     #[test]
     fn the_panel_is_drawn_only_when_its_image_arrived() {
         let (p, _) = read(&fanshop(), PLACES).unwrap();
-        assert!(matches!(p.visual(), Some(Visual::Image(_))));
+        assert!(matches!(p.visual(), Some(Visual::Map(_))));
         let with = draw(&p, Some(b"png"));
         assert!(with.contains("place-panel"));
         assert!(with.contains("FanShop") && with.contains("OrangeCampus"));
         assert!(with.contains("Cafe · Coffee shop"));
         assert!(with.contains("37 Wiblinger Straße"));
         assert!(!draw(&p, None).contains("place-panel"));
+    }
+
+    #[test]
+    fn a_map_carries_the_pin_and_the_credit_and_an_image_neither() {
+        let (map, _) = read(&fanshop(), PLACES).unwrap();
+        let svg = draw(&map, Some(b"png"));
+        assert!(svg.contains("place-pin"));
+        assert!(svg.contains("© OpenStreetMap contributors · OpenFreeMap"));
+        let image = Place {
+            panel: Some(Panel::Image("https://x.test/a.jpg".into())),
+            ..map
+        };
+        assert!(matches!(image.visual(), Some(Visual::Image(_))));
+        let svg = draw(&image, Some(b"png"));
+        assert!(!svg.contains("place-pin") && !svg.contains("OpenStreetMap"));
     }
 
     #[test]

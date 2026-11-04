@@ -36,6 +36,8 @@ hex = "0.4"
 resvg = "0.47"
 image = "0.25"
 base64 = "0.22"
+# Tiles arrive gzipped; already in the tree.
+flate2 = "1"
 # Glyph advances for fitting text before layout; already in the tree via fontdb.
 ttf-parser = "0.25"
 
