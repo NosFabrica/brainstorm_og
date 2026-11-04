@@ -197,9 +197,9 @@ impl<'a> Layer<'a> {
 
 impl<'a> Feature<'_, 'a> {
     pub fn get(&self, key: &str) -> Option<Value<'a>> {
-        self.tags.chunks_exact(2).find_map(|kv| {
-            let k = self.layer.keys.get(kv[0] as usize)?;
-            (*k == key).then(|| self.layer.values.get(kv[1] as usize).copied())?
+        self.tags.as_chunks::<2>().0.iter().find_map(|&[k, v]| {
+            let k = self.layer.keys.get(k as usize)?;
+            (*k == key).then(|| self.layer.values.get(v as usize).copied())?
         })
     }
 
