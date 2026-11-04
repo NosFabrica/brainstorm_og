@@ -17,6 +17,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::{routing::get, Json, Router};
 use brainstorm_og::config::Config;
+use brainstorm_og::nip19::Entity;
+use common::relay::{event, StubRelay};
 use http_body_util::BodyExt;
 use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -132,20 +134,37 @@ async fn an_unknown_code_does_not_claim_a_profile() {
 
 #[tokio::test]
 async fn a_code_for_another_kind_of_entity_does_not_claim_a_profile() {
-    // Its key may be 64 hex (an event id), so the kind is what must decide.
+    // Its key is 64 hex like a pubkey, and the relay has a profile for it: the kind must decide.
+    let relay = StubRelay::start(vec![
+        event(HEX, HEX, 1, "hello", json!([])),
+        event(&"0".repeat(64), HEX, 0, r#"{"name":"alice"}"#, json!([])),
+    ])
+    .await;
     let (api, hits) = stub_api().await;
-    let app = router(api);
+    let app = common::router_with(Config {
+        api_base_url: api,
+        app_base_url: APP.into(),
+        local_relay_url: relay.url.clone(),
+        ..common::config()
+    });
 
+    let nevent = Entity::Event { id: HEX.into() }.canonical();
     for _ in 0..2 {
         let (status, body) = get_on(&app, &format!("/s/{EVENT_CODE}")).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert!(!body.contains("og:title"), "invented a card: {body}");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body.contains(&format!(
+                r#"<link rel="canonical" href="{APP}/e/{nevent}"/>"#
+            )),
+            "not the note card: {body}"
+        );
+        assert!(
+            !body.contains(r#"content="profile""#),
+            "a profile card: {body}"
+        );
+        assert!(!body.contains("/p/"), "a profile card: {body}");
     }
-    assert_eq!(
-        hits.load(Ordering::SeqCst),
-        1,
-        "not-a-profile answer not cached"
-    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "event code not cached");
 }
 
 #[tokio::test]

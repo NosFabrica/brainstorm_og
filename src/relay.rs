@@ -23,26 +23,40 @@ pub async fn fetch_kind0(
     pubkey_hex: &str,
     timeout_secs: u64,
 ) -> Result<ProfileMeta> {
+    let filter = json!({ "authors": [pubkey_hex], "kinds": [0], "limit": 1 });
+    let events = fetch_events(relay_url, filter, timeout_secs).await?;
+    let event = events
+        .iter()
+        .filter(|e| e.get("kind").and_then(Value::as_u64) == Some(0))
+        .max_by_key(|e| e.get("created_at").and_then(Value::as_u64))
+        .ok_or_else(|| anyhow!("no kind-0 event from {relay_url}"))?;
+    // A malformed `content` is a bad event, not a failed fetch.
+    ProfileMeta::from_kind0_content(event.get("content").and_then(Value::as_str).unwrap_or("{}"))
+}
+
+/// Every event the relay returns for `filter` up to EOSE. `include:spam` is
+/// added here so no read can forget the lens.
+pub async fn fetch_events(
+    relay_url: &str,
+    mut filter: Value,
+    timeout_secs: u64,
+) -> Result<Vec<Value>> {
+    filter["search"] = json!("include:spam");
     timeout(
         Duration::from_secs(timeout_secs),
-        fetch_inner(relay_url, pubkey_hex),
+        fetch_inner(relay_url, filter),
     )
     .await
     .map_err(|_| anyhow!("relay {relay_url} timed out"))?
 }
 
-async fn fetch_inner(relay_url: &str, pubkey_hex: &str) -> Result<ProfileMeta> {
+async fn fetch_inner(relay_url: &str, filter: Value) -> Result<Vec<Value>> {
     let (mut ws, _) = tokio_tungstenite::connect_async(relay_url).await?;
-
-    let filter = json!({
-        "authors": [pubkey_hex],
-        "kinds": [0],
-        "limit": 1,
-        "search": "include:spam",
-    });
+    let limit = filter.get("limit").and_then(Value::as_u64);
     let req = json!(["REQ", "og", filter]);
     ws.send(Message::Text(req.to_string().into())).await?;
 
+    let mut events = Vec::new();
     while let Some(msg) = ws.next().await {
         let text = match msg? {
             Message::Text(t) => t.to_string(),
@@ -50,35 +64,26 @@ async fn fetch_inner(relay_url: &str, pubkey_hex: &str) -> Result<ProfileMeta> {
             Message::Close(_) => break,
             _ => continue,
         };
-
         let Ok(value) = serde_json::from_str::<Value>(&text) else {
             continue;
         };
         let Some(arr) = value.as_array() else {
             continue;
         };
-
+        // Anything else, the AUTH challenge included, is ignored.
         match arr.first().and_then(Value::as_str) {
             Some("EVENT") => {
                 if let Some(event) = arr.get(2) {
-                    if event.get("kind").and_then(Value::as_u64) == Some(0) {
-                        let content = event.get("content").and_then(Value::as_str).unwrap_or("{}");
-                        // A malformed `content` is a bad event, not a failed
-                        // fetch — don't propagate it as an error and don't
-                        // leave the socket open.
-                        let meta = ProfileMeta::from_kind0_content(content);
-                        let _ = ws.close(None).await;
-                        return meta;
+                    events.push(event.clone());
+                    if limit.is_some_and(|l| events.len() as u64 >= l) {
+                        break;
                     }
                 }
             }
-            Some("EOSE") => {
-                let _ = ws.close(None).await;
-                break;
-            }
+            Some("EOSE") | Some("CLOSED") => break,
             _ => {}
         }
     }
-
-    Err(anyhow!("no kind-0 event from {relay_url}"))
+    let _ = ws.close(None).await;
+    Ok(events)
 }

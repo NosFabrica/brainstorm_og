@@ -1,5 +1,7 @@
-//! The share card: 1200x630 PNG, SVG -> raster via resvg. Identity only —
-//! wordmark, avatar, name, nip05. See CONTEXT.md.
+//! The share card: 1200x630 PNG, SVG -> raster via resvg. Every card shares
+//! one frame (surface, wash, wordmark); the profile card draws identity only —
+//! avatar, name, nip05 — and entity cards a per-kind body plus an author strip.
+//! See CONTEXT.md.
 
 use anyhow::{anyhow, Result};
 use base64::Engine as _;
@@ -7,6 +9,7 @@ use resvg::{tiny_skia, usvg};
 use std::io::Cursor;
 use std::time::Duration;
 
+use crate::cards::{DrawCx, EntityCard, Visual};
 use crate::data::Card;
 use crate::state::AppState;
 
@@ -16,12 +19,12 @@ pub const HEIGHT: u32 = 630;
 // Brand tokens. Note the slate ramp is REDEFINED in `tailwind.config.ts:115` —
 // slate-900 is #151c2a here, not Tailwind's stock #0f172a. Taking the stock
 // values would put the card a few shades off every other dark surface.
-const SURFACE: &str = "#151c2a"; // slate-900 — the dark card base
-const ACCENT: &str = "#13d2e5"; // Aurora Cyan
-const PRIMARY: &str = "#7237ff"; // Aurora Purple
-const INK: &str = "#f2f3f0"; // slate-50 — primary text on dark
-const LINK: &str = "#a78bfa"; // --brand-link dark override, index.css:147
-const MUTED: &str = "#9aa1ac"; // slate-400
+pub const SURFACE: &str = "#151c2a"; // slate-900 — the dark card base
+pub const ACCENT: &str = "#13d2e5"; // Aurora Cyan
+pub const PRIMARY: &str = "#7237ff"; // Aurora Purple
+pub const INK: &str = "#f2f3f0"; // slate-50 — primary text on dark
+pub const LINK: &str = "#a78bfa"; // --brand-link dark override, index.css:147
+pub const MUTED: &str = "#9aa1ac"; // slate-400
 
 // Avatar block, left of the identity text.
 const AV_X: f32 = 72.0;
@@ -30,6 +33,17 @@ const AV_SIZE: f32 = 300.0;
 const AV_RADIUS: f32 = 56.0;
 
 const TEXT_X: f32 = 424.0;
+
+/// Entity cards: the content box below the wordmark and above the author strip.
+pub const CONTENT_X: f32 = 72.0;
+pub const CONTENT_TOP: f32 = 160.0;
+pub const CONTENT_W: f32 = 1056.0;
+pub const CONTENT_BOTTOM: f32 = 490.0;
+/// Content box bottom when there is no author strip.
+pub const CONTENT_BOTTOM_NO_AUTHOR: f32 = 574.0;
+
+const STRIP_AV: f32 = 64.0;
+const STRIP_Y: f32 = 526.0;
 
 /// What the avatar is re-encoded to before being embedded. Derived from the
 /// drawn size so the two cannot drift: the card is rasterised 1:1 at its
@@ -59,20 +73,138 @@ const WORDMARK_H: f32 = WORDMARK_W * 0.23;
 
 /// Render a profile card to PNG. Missing avatar / metadata degrade gracefully.
 pub async fn render_card(state: &AppState, card: &Card) -> Result<Vec<u8>> {
-    let avatar = match &card.meta.picture {
-        Some(url) => match fetch_avatar(state, url).await {
-            Ok(bytes) => Some(bytes),
-            Err(e) => {
-                // Silently dropping this made a missing avatar indistinguishable
-                // from a profile that has none.
-                tracing::warn!("avatar fetch failed for {url}: {e:#}");
-                None
-            }
-        },
-        None => None,
-    };
+    let avatar = fetch_optional(state, card.meta.picture.as_deref(), AVATAR_PX, AVATAR_PX).await;
     let svg = build_svg(state, card, avatar.as_deref());
     rasterize(state, svg).await
+}
+
+/// Render an entity card: shared frame, the kind's body, the author strip.
+pub async fn render_entity(state: &AppState, card: &EntityCard) -> Result<Vec<u8>> {
+    let built = &card.built;
+    let picture = built.author.as_ref().and_then(|a| a.picture.as_deref());
+    let (avatar, image) = tokio::join!(
+        fetch_optional(state, picture, STRIP_AV as u32, STRIP_AV as u32),
+        async {
+            match built.body.visual() {
+                Some(Visual::Image(r)) => {
+                    fetch_optional(state, Some(&r.url), r.width, r.height).await
+                }
+                None => None,
+            }
+        }
+    );
+
+    let family = state.config.font_family.clone();
+    let body = {
+        let measurer = state.metrics.measurer();
+        built.body.draw(&DrawCx {
+            family: &family,
+            measure: &|text, size, weight| measurer.measure(text, size, weight),
+            image: image.as_deref(),
+        })
+    };
+    let strip = built
+        .author
+        .as_ref()
+        .map(|a| author_strip(&esc(&family), &a.name, avatar.as_deref()))
+        .unwrap_or_default();
+    rasterize(state, frame(&format!("{body}\n{strip}"))).await
+}
+
+/// The bundled faces in resvg's fallback order (primary, then the rest as loaded), for measuring text before layout.
+pub struct Metrics {
+    faces: Vec<(Vec<u8>, u32)>,
+}
+
+impl Metrics {
+    pub fn load(db: &usvg::fontdb::Database, family: &str) -> Option<Self> {
+        let primary = db.query(&usvg::fontdb::Query {
+            families: &[usvg::fontdb::Family::Name(family)],
+            ..Default::default()
+        })?;
+        let rest: Vec<_> = db
+            .faces()
+            .map(|f| f.id)
+            .filter(|&id| id != primary)
+            .collect();
+        let faces = std::iter::once(primary)
+            .chain(rest)
+            .map(|id| db.with_face_data(id, |data, index| (data.to_vec(), index)))
+            .collect::<Option<Vec<_>>>()?;
+        Some(Metrics { faces })
+    }
+
+    pub fn measurer(&self) -> Measurer<'_> {
+        Measurer {
+            base: self
+                .faces
+                .iter()
+                .filter_map(|(data, index)| ttf_parser::Face::parse(data, *index).ok())
+                .collect(),
+            weighted: Default::default(),
+        }
+    }
+
+    pub fn measure(&self, text: &str, size: f32, weight: u16) -> f32 {
+        self.measurer().measure(text, size, weight)
+    }
+}
+
+/// Parsed faces, with a `wght` instance per weight asked for.
+pub struct Measurer<'a> {
+    base: Vec<ttf_parser::Face<'a>>,
+    weighted: std::cell::RefCell<Vec<(u16, Vec<ttf_parser::Face<'a>>)>>,
+}
+
+impl Measurer<'_> {
+    /// Advance width of `text`, each char from the first face that has it, as resvg falls back.
+    pub fn measure(&self, text: &str, size: f32, weight: u16) -> f32 {
+        // resvg leaves the default instance alone at 400.
+        if weight == 400 {
+            return advance(&self.base, text) * size;
+        }
+        let mut weighted = self.weighted.borrow_mut();
+        let i = match weighted.iter().position(|(w, _)| *w == weight) {
+            Some(i) => i,
+            None => {
+                let mut faces = self.base.clone();
+                for f in &mut faces {
+                    f.set_variation(ttf_parser::Tag::from_bytes(b"wght"), weight as f32);
+                }
+                weighted.push((weight, faces));
+                weighted.len() - 1
+            }
+        };
+        advance(&weighted[i].1, text) * size
+    }
+}
+
+/// In ems. A char no face has is drawn as the primary's missing-glyph box.
+fn advance(faces: &[ttf_parser::Face], text: &str) -> f32 {
+    let em = |f: &ttf_parser::Face, g| {
+        f.glyph_hor_advance(g).unwrap_or(0) as f32 / f.units_per_em() as f32
+    };
+    text.chars()
+        .map(|c| {
+            faces
+                .iter()
+                .find_map(|f| f.glyph_index(c).map(|g| em(f, g)))
+                .or_else(|| faces.first().map(|f| em(f, ttf_parser::GlyphId(0))))
+                .unwrap_or(0.6)
+        })
+        .sum()
+}
+
+async fn fetch_optional(state: &AppState, url: Option<&str>, w: u32, h: u32) -> Option<Vec<u8>> {
+    let url = url?;
+    match fetch_image(state, url, w, h).await {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            // Otherwise a failed fetch looks like no image at all.
+            tracing::warn!("image fetch failed for {url}: {e:#}");
+            None
+        }
+    }
 }
 
 /// Last-resort branded card. `None` rather than an empty `Vec`, which would be
@@ -88,9 +220,9 @@ pub async fn render_fallback(state: &AppState) -> Option<Vec<u8>> {
     rasterize(state, svg).await.ok()
 }
 
-/// Fetch and normalise a kind-0 `picture`. The URL is attacker-controlled:
+/// Fetch an image and fill it to `w`x`h`. The URL is attacker-controlled:
 /// `net` validates the address, the size cap and dimension check are here.
-async fn fetch_avatar(state: &AppState, url: &str) -> Result<Vec<u8>> {
+async fn fetch_image(state: &AppState, url: &str, out_w: u32, out_h: u32) -> Result<Vec<u8>> {
     let max = state.config.avatar_max_bytes;
     let mut target = crate::net::validate_and_resolve(url, &["http", "https"]).await?;
 
@@ -184,11 +316,9 @@ async fn fetch_avatar(state: &AppState, url: &str) -> Result<Vec<u8>> {
         l.max_alloc = Some(MAX_AVATAR_ALLOC);
         l
     });
-    let img = reader.decode()?.resize_to_fill(
-        AVATAR_PX,
-        AVATAR_PX,
-        image::imageops::FilterType::Lanczos3,
-    );
+    let img = reader
+        .decode()?
+        .resize_to_fill(out_w, out_h, image::imageops::FilterType::Lanczos3);
 
     let mut out = Cursor::new(Vec::new());
     img.write_to(&mut out, image::ImageFormat::Png)?;
@@ -237,6 +367,17 @@ fn build_svg(state: &AppState, card: &Card, avatar_png: Option<&[u8]>) -> String
         })
         .unwrap_or_default();
 
+    frame(&format!(
+        r##"{avatar_svg}
+<text x="{TEXT_X}" y="312" font-family="{family}" font-size="72" font-weight="700" fill="{INK}">{name}</text>
+{nip05_svg}
+<text x="72" y="574" font-family="{family}" font-size="30" fill="{MUTED}">{tagline}</text>"##,
+        tagline = esc(tagline_for(card)),
+    ))
+}
+
+/// The card family's shared frame: surface, wash, wordmark. `inner` is the content.
+fn frame(inner: &str) -> String {
     format!(
         r##"<svg xmlns="http://www.w3.org/2000/svg" width="{WIDTH}" height="{HEIGHT}" viewBox="0 0 {WIDTH} {HEIGHT}">
 <defs>
@@ -253,13 +394,41 @@ fn build_svg(state: &AppState, card: &Card, avatar_png: Option<&[u8]>) -> String
 <rect width="{WIDTH}" height="{HEIGHT}" fill="{SURFACE}"/>
 <rect width="{WIDTH}" height="{HEIGHT}" fill="url(#wash)"/>
 {wordmark}
-{avatar_svg}
-<text x="{TEXT_X}" y="312" font-family="{family}" font-size="72" font-weight="700" fill="{INK}">{name}</text>
-{nip05_svg}
-<text x="72" y="574" font-family="{family}" font-size="30" fill="{MUTED}">{tagline}</text>
+{inner}
 </svg>"##,
         wordmark = wordmark_svg(72.0, 72.0),
-        tagline = esc(tagline_for(card)),
+    )
+}
+
+/// A PNG filling `w`x`h` at (`x`, `y`), clipped to corner radius `r`. `id` must be unique in the card.
+pub fn embed_png(id: &str, x: f32, y: f32, w: f32, h: f32, r: f32, png: &[u8]) -> String {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(png);
+    format!(
+        r##"<clipPath id="{id}"><rect x="{x}" y="{y}" width="{w}" height="{h}" rx="{r}"/></clipPath>
+<image x="{x}" y="{y}" width="{w}" height="{h}" href="data:image/png;base64,{b64}" clip-path="url(#{id})" preserveAspectRatio="xMidYMid slice"/>"##
+    )
+}
+
+/// Small avatar + name at the bottom of an entity card.
+fn author_strip(family: &str, name: &str, avatar_png: Option<&[u8]>) -> String {
+    let raw = truncate(&sanitize(name), 40);
+    let name = esc(&raw);
+    let (x, y, size, r) = (CONTENT_X, STRIP_Y, STRIP_AV, STRIP_AV / 2.0);
+    let avatar = match avatar_png {
+        Some(png) => embed_png("strip-av", x, y, size, size, r, png),
+        None => format!(
+            r##"<rect x="{x}" y="{y}" width="{size}" height="{size}" rx="{r}" fill="{PRIMARY}" fill-opacity="0.18"/>
+<text x="{cx}" y="{cy}" font-family="{family}" font-size="30" font-weight="700" fill="{LINK}" text-anchor="middle" dominant-baseline="central">{initial}</text>"##,
+            cx = x + r,
+            cy = y + r,
+            initial = esc(&first_initial(&raw)),
+        ),
+    };
+    format!(
+        r##"{avatar}
+<text x="{tx}" y="{ty}" font-family="{family}" font-size="30" font-weight="600" fill="{INK}">{name}</text>"##,
+        tx = x + size + 20.0,
+        ty = y + r + 10.0,
     )
 }
 
@@ -290,10 +459,9 @@ fn wordmark_svg(x: f32, y: f32) -> String {
 fn avatar_block(family: &str, avatar_png: Option<&[u8]>, name: &str) -> String {
     match avatar_png {
         Some(png) => {
-            let b64 = base64::engine::general_purpose::STANDARD.encode(png);
+            let image = embed_png("av", AV_X, AV_Y, AV_SIZE, AV_SIZE, AV_RADIUS, png);
             format!(
-                r##"<clipPath id="av"><rect x="{AV_X}" y="{AV_Y}" width="{AV_SIZE}" height="{AV_SIZE}" rx="{AV_RADIUS}"/></clipPath>
-<image x="{AV_X}" y="{AV_Y}" width="{AV_SIZE}" height="{AV_SIZE}" href="data:image/png;base64,{b64}" clip-path="url(#av)" preserveAspectRatio="xMidYMid slice"/>
+                r##"{image}
 <rect x="{AV_X}" y="{AV_Y}" width="{AV_SIZE}" height="{AV_SIZE}" rx="{AV_RADIUS}" fill="none" stroke="{ACCENT}" stroke-opacity="0.25" stroke-width="3"/>"##
             )
         }
@@ -311,7 +479,7 @@ fn avatar_block(family: &str, avatar_png: Option<&[u8]>, name: &str) -> String {
 
 /// Drop control characters and bidi overrides — an RTL override in a display
 /// name can visually reorder the rest of the card.
-fn sanitize(s: &str) -> String {
+pub fn sanitize(s: &str) -> String {
     s.chars()
         .filter(|c| {
             !c.is_control()
@@ -346,7 +514,7 @@ fn first_initial(name: &str) -> String {
 
 /// XML escaping. `&apos;` here vs `&#39;` in `routes::esc` — SVG is XML, that
 /// is HTML. Do not unify them.
-fn esc(s: &str) -> String {
+pub fn esc(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -379,6 +547,51 @@ mod tests {
     #[test]
     fn esc_covers_the_xml_five() {
         assert_eq!(esc(r#"<&>"'"#), "&lt;&amp;&gt;&quot;&apos;");
+    }
+
+    fn fonts() -> usvg::fontdb::Database {
+        let mut db = usvg::fontdb::Database::new();
+        db.load_fonts_dir("assets");
+        db
+    }
+
+    /// Ink width as resvg lays the line out. Long lines make side bearings negligible.
+    fn laid_out(db: &usvg::fontdb::Database, text: &str, size: f32, weight: u16) -> f32 {
+        let svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="20000" height="400"><text x="0" y="200" font-family="Figtree" font-size="{size}" font-weight="{weight}">{}</text></svg>"#,
+            esc(text)
+        );
+        let opt = usvg::Options {
+            font_family: "Figtree".into(),
+            fontdb: std::sync::Arc::new(db.clone()),
+            ..Default::default()
+        };
+        let tree = usvg::Tree::from_str(&svg, &opt).unwrap();
+        tree.root().abs_bounding_box().width()
+    }
+
+    #[test]
+    fn measuring_matches_the_rendered_width_across_scripts_and_weights() {
+        let db = fonts();
+        let m = Metrics::load(&db, "Figtree").unwrap();
+        for text in [
+            "The quick brown fox jumps over the lazy dog",
+            "Съешь же ещё этих мягких французских булок",
+            "いろはにほへと ちりぬるを わかよたれそ",
+            "Café 東京 Москва",
+        ] {
+            for weight in [400, 600, 700] {
+                let line = [text; 4].join(" ");
+                let want = laid_out(&db, &line, 40.0, weight);
+                let got = m.measure(&line, 40.0, weight);
+                // Never narrower than drawn (that overflows); a little wider just wraps early.
+                let ratio = got / want;
+                assert!(
+                    (0.98..1.05).contains(&ratio),
+                    "{text} @{weight}: measured {got}, drawn {want}"
+                );
+            }
+        }
     }
 
     #[test]

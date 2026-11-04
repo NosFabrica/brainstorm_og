@@ -24,9 +24,13 @@ pub struct AppState {
     /// resolution time rather than only before the connection.
     pub preview_http: reqwest::Client,
     pub fontdb: Arc<fontdb::Database>,
+    /// Bundled faces, for measuring text before layout.
+    pub metrics: Arc<crate::render::Metrics>,
     pub card_cache: Cache<String, Card>,
-    /// Short code -> hex pubkey, or `None` for a non-profile code. Immutable once minted, so no TTL.
-    pub short_code_cache: Cache<String, Option<String>>,
+    /// Entity key -> card or settled skip. Not-found is never cached.
+    pub entity_cache: Cache<String, crate::cards::Outcome>,
+    /// Short code -> what it names. Immutable once minted, so no TTL.
+    pub short_code_cache: Cache<String, crate::data::ShortTarget>,
     pub png_cache: Cache<String, Bytes>,
     /// Fixed-window rate-limit counters for `/link-preview`, keyed by tier and
     /// client IP. Entries expire with the window.
@@ -72,6 +76,8 @@ impl AppState {
                 available
             );
         }
+        let metrics = crate::render::Metrics::load(&db, &config.font_family)
+            .context("loading font metrics")?;
         tracing::info!(
             font_family = %config.font_family,
             faces = db.len(),
@@ -100,6 +106,13 @@ impl AppState {
             .max_capacity(config.card_cache_capacity)
             // Provisional cards expire sooner; see CardExpiry.
             .expire_after(crate::data::CardExpiry {
+                provisional: Duration::from_secs(config.provisional_ttl_secs),
+                normal: ttl,
+            })
+            .build();
+        let entity_cache = Cache::builder()
+            .max_capacity(config.card_cache_capacity)
+            .expire_after(crate::cards::OutcomeExpiry {
                 provisional: Duration::from_secs(config.provisional_ttl_secs),
                 normal: ttl,
             })
@@ -135,7 +148,9 @@ impl AppState {
             avatar_http,
             preview_http,
             fontdb: Arc::new(db),
+            metrics: Arc::new(metrics),
             card_cache,
+            entity_cache,
             short_code_cache,
             png_cache,
             preview_rate,

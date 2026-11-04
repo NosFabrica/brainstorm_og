@@ -6,8 +6,9 @@ use axum::{
 use bytes::Bytes;
 use serde::Deserialize;
 
-use crate::data::{self, Card};
-use crate::nip19::{self, Pointer};
+use crate::cards::{self, EntityCard, Skip};
+use crate::data::{self, Card, ShortTarget};
+use crate::nip19::{self, Entity, Pointer};
 use crate::render;
 use crate::state::AppState;
 
@@ -24,6 +25,7 @@ pub async fn healthz(State(st): State<AppState>) -> Response {
         // fact rather than an estimate.
         "caches": {
             "card": cache_stats(&st.card_cache),
+            "entity": cache_stats(&st.entity_cache),
             "short_code": cache_stats(&st.short_code_cache),
             "png": cache_stats(&st.png_cache),
             "preview_rate": cache_stats(&st.preview_rate),
@@ -68,23 +70,51 @@ pub async fn profile(State(st): State<AppState>, Path(id): Path<String>) -> Resp
     meta_response(&st, &id, &card)
 }
 
-/// `/s/{code}` — a short share link. Renders the same card `/p/{id}` does.
+/// `/s/{code}` — a short share link. Renders the card its target's own route does.
 ///
-/// An unresolvable code returns 404 rather than a card: a preview claiming a
-/// profile that doesn't exist is worse than no preview.
+/// An unresolvable code returns 404 rather than a card: a preview claiming
+/// something that doesn't exist is worse than no preview.
 pub async fn short_link(State(st): State<AppState>, Path(code): Path<String>) -> Response {
-    let Some(hex) = data::resolve_short_code(&st, &code).await else {
-        return unknown_code();
-    };
+    match data::resolve_short_code(&st, &code).await {
+        Some(ShortTarget::Profile(hex)) => {
+            let pointer = Pointer { hex };
+            let card = data::get_card(&st, &pointer).await;
+            // Canonical is the hint-free npub, so short-link and npub shares consolidate.
+            let id = nip19::npub_from_hex(&pointer.hex).unwrap_or_else(|| pointer.hex.clone());
+            meta_response(&st, &id, &card)
+        }
+        Some(ShortTarget::Entity(entity)) => entity_page(&st, &entity).await,
+        Some(ShortTarget::Other) | None => unknown_code(),
+    }
+}
 
-    let pointer = Pointer { hex };
-    let card = data::get_card(&st, &pointer).await;
-    // Canonical names the profile, not the link that pointed at it — and as an
-    // npub, so a short-link share and a plain npub share consolidate into one
-    // page for crawlers. Relay hints are deliberately left out: they vary per
-    // link, and a canonical url that varies is not canonical.
-    let id = nip19::npub_from_hex(&pointer.hex).unwrap_or_else(|| pointer.hex.clone());
-    meta_response(&st, &id, &card)
+/// `/e/{nevent|note|naddr}` — a note, article, calendar or place card.
+pub async fn entity(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+    match nip19::decode_entity(&id) {
+        Ok(entity) => entity_page(&st, &entity).await,
+        Err(e) => {
+            tracing::debug!("bad entity id {id}: {e}");
+            bad_id()
+        }
+    }
+}
+
+async fn entity_page(st: &AppState, entity: &Entity) -> Response {
+    match cards::get(st, entity).await {
+        Ok(card) => entity_meta_response(st, &card),
+        Err(skip) => skipped(st, skip),
+    }
+}
+
+/// A skipped card: not-found may just be new so is short-lived; the rest cache like a card.
+fn skipped(st: &AppState, skip: Skip) -> Response {
+    let mut headers = HeaderMap::new();
+    let max_age = match skip {
+        Skip::NotFound => 60,
+        _ => st.config.cache_ttl_secs,
+    };
+    set_cache(&mut headers, &format!("public, max-age={max_age}"));
+    (StatusCode::NOT_FOUND, headers).into_response()
 }
 
 /// Briefly cached, unlike `bad_id`: an unknown code is a fact about the
@@ -129,19 +159,51 @@ pub async fn og_image(
         }
         Err(e) => {
             tracing::warn!("render failed for {}: {e}", pointer.hex);
-            // Not cached: a transient failure must not outlive itself.
-            match render::render_fallback(&st).await {
-                Some(bytes) => {
-                    let mut headers = png_headers();
-                    set_cache(&mut headers, "no-store");
-                    (headers, Bytes::from(bytes)).into_response()
-                }
-                None => {
-                    let mut headers = HeaderMap::new();
-                    set_cache(&mut headers, "no-store");
-                    (StatusCode::SERVICE_UNAVAILABLE, headers).into_response()
-                }
-            }
+            render_failed(&st).await
+        }
+    }
+}
+
+/// Not cached: a transient failure must not outlive itself.
+async fn render_failed(st: &AppState) -> Response {
+    let mut headers = HeaderMap::new();
+    set_cache(&mut headers, "no-store");
+    match render::render_fallback(st).await {
+        Some(bytes) => {
+            headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
+            (headers, Bytes::from(bytes)).into_response()
+        }
+        None => (StatusCode::SERVICE_UNAVAILABLE, headers).into_response(),
+    }
+}
+
+/// `/og/e/{id}.png` — an entity card. The PNG cache keys on the entity.
+pub async fn og_entity_image(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Query(_q): Query<ImageQuery>,
+) -> Response {
+    let id = id.strip_suffix(".png").unwrap_or(&id);
+    let Ok(entity) = nip19::decode_entity(id) else {
+        return bad_id();
+    };
+    let key = entity.key();
+    if let Some(cached) = st.png_cache.get(&key).await {
+        return image_response(&st, cached);
+    }
+    let card = match cards::get(&st, &entity).await {
+        Ok(card) => card,
+        Err(skip) => return skipped(&st, skip),
+    };
+    match render::render_entity(&st, &card).await {
+        Ok(bytes) => {
+            let bytes = Bytes::from(bytes);
+            st.png_cache.insert(key, bytes.clone()).await;
+            image_response(&st, bytes)
+        }
+        Err(e) => {
+            tracing::warn!("render failed for {key}: {e}");
+            render_failed(&st).await
         }
     }
 }
@@ -172,9 +234,60 @@ fn image_response(st: &AppState, bytes: Bytes) -> Response {
     (headers, bytes).into_response()
 }
 
-/// The HTML response both `/p/{id}` and `/s/{code}` return.
+/// The profile page `/p/{id}` and a profile `/s/{code}` return.
 fn meta_response(st: &AppState, id: &str, card: &Card) -> Response {
-    let html = build_meta_html(st, id, card);
+    let app = &st.config.app_base_url;
+    let title = format!("{} on Brainstorm", card.display_name());
+    html_response(
+        st,
+        &Page {
+            description: meta_description(card),
+            // From config, never the request Host. See CONTEXT.md.
+            page_url: format!("{app}/p/{id}"),
+            image_url: format!(
+                "{app}/og/{id}.png?v={}",
+                card.version(&st.config.render_epoch)
+            ),
+            image_alt: title.clone(),
+            title,
+            og_type: "profile",
+            extra: vec![],
+        },
+    )
+}
+
+/// The `/e/` page: canonical is the hint-free `/e/` link.
+fn entity_meta_response(st: &AppState, card: &EntityCard) -> Response {
+    let app = &st.config.app_base_url;
+    let id = card.entity.canonical();
+    html_response(
+        st,
+        &Page {
+            title: card.built.meta.title.clone(),
+            description: card.built.meta.description.clone(),
+            page_url: format!("{app}/e/{id}"),
+            image_url: format!(
+                "{app}/og/e/{id}.png?v={}",
+                card.version(&st.config.render_epoch)
+            ),
+            image_alt: card.built.meta.title.clone(),
+            og_type: card.built.meta.og_type,
+            extra: card.built.meta.extra.clone(),
+        },
+    )
+}
+
+struct Page {
+    title: String,
+    description: String,
+    page_url: String,
+    image_url: String,
+    image_alt: String,
+    og_type: &'static str,
+    extra: Vec<(&'static str, String)>,
+}
+
+fn html_response(st: &AppState, page: &Page) -> Response {
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
@@ -185,7 +298,7 @@ fn meta_response(st: &AppState, id: &str, card: &Card) -> Response {
         &mut headers,
         &format!("public, max-age={}", st.config.html_cache_max_age),
     );
-    (headers, Html(html)).into_response()
+    (headers, Html(page_html(page))).into_response()
 }
 
 fn set_cache(headers: &mut HeaderMap, value: &str) {
@@ -194,18 +307,18 @@ fn set_cache(headers: &mut HeaderMap, value: &str) {
     }
 }
 
-fn build_meta_html(st: &AppState, id: &str, card: &Card) -> String {
-    let app = &st.config.app_base_url;
-    let title = esc(&format!("{} on Brainstorm", card.display_name()));
-    let desc = esc(&meta_description(card));
-
-    // From config, never the request Host. See CONTEXT.md.
-    let page_url = esc(&format!("{app}/p/{id}"));
-    let image_url = esc(&format!(
-        "{app}/og/{id}.png?v={}",
-        card.version(&st.config.render_epoch)
-    ));
-    let image_alt = esc(&format!("{} on Brainstorm", card.display_name()));
+fn page_html(page: &Page) -> String {
+    let title = esc(&page.title);
+    let desc = esc(&page.description);
+    let page_url = esc(&page.page_url);
+    let image_url = esc(&page.image_url);
+    let image_alt = esc(&page.image_alt);
+    let og_type = esc(page.og_type);
+    let extra: String = page
+        .extra
+        .iter()
+        .map(|(p, c)| format!("<meta property=\"{}\" content=\"{}\"/>\n", esc(p), esc(c)))
+        .collect();
 
     format!(
         r#"<!doctype html>
@@ -216,8 +329,8 @@ fn build_meta_html(st: &AppState, id: &str, card: &Card) -> String {
 <title>{title}</title>
 <meta name="description" content="{desc}"/>
 <link rel="canonical" href="{page_url}"/>
-<meta property="og:type" content="profile"/>
-<meta property="og:site_name" content="Brainstorm"/>
+<meta property="og:type" content="{og_type}"/>
+{extra}<meta property="og:site_name" content="Brainstorm"/>
 <meta property="og:title" content="{title}"/>
 <meta property="og:description" content="{desc}"/>
 <meta property="og:url" content="{page_url}"/>

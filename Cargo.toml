@@ -36,6 +36,8 @@ hex = "0.4"
 resvg = "0.47"
 image = "0.25"
 base64 = "0.22"
+# Glyph advances for fitting text before layout; already in the tree via fontdb.
+ttf-parser = "0.25"
 
 # Bounded in-memory cache.
 moka = { version = "0.12", features = ["future"] }
@@ -48,6 +50,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 lol_html = "3"
 encoding_rs = "0.8"
 html-escape = "0.2"
+# Calendar card times; chrono-tz embeds the IANA db (scratch image has none).
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+chrono-tz = { version = "0.10.4", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

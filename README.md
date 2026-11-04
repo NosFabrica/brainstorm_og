@@ -20,14 +20,21 @@ the SPA's generic card rather than breaking anything.
   `Brainstorm-UI/client/src/lib/shareId.ts` accepts.
 - `GET /profile/{id}` → the same, kept only for links already in the wild.
   `og:url` and `canonical` still point at `/p/`.
-- `GET /s/{code}` → the same card for a **short share link**. The code is
-  resolved to a pubkey via the API and cached; `og:url` and `canonical` point at
-  `/p/`, since the card names the profile rather than the link to it. An
-  unresolvable code, or one for a non-profile entity, is a 404, never a card
-  for a profile that doesn't exist.
+- `GET /e/{nevent|note|naddr}` → meta tags for a **note** (kind 1), **article**
+  (30023), **calendar event** (31922/31923) or **place** (a 39999/9999 DList
+  item under `PLACE_CONCEPT`); other kinds are 404. Read from the search relay
+  by id or coordinate, one retry after `ENTITY_RETRY_DELAY_MS` on a miss.
+  Skipped (404) when not found (`max-age=60`, not cached), NSFW, deleted by its
+  author, or empty after stripping. A failed delete check still draws the card
+  but caches it like a provisional one. `canonical` is the hint-free `/e/` link.
+- `GET /s/{code}` → the card for a **short share link**, resolved via the API
+  and cached. `profile` codes render the `/p/` card (canonical `/p/`), `event`
+  and `address` codes the `/e/` one (canonical `/e/`). `hashtag`/`tag` codes
+  and unresolvable ones are 404.
   Registered under `/S/` too: the QR payload is uppercase, and nginx proxies the
   URI unchanged.
-- `GET /og/{id}.png?v={hash}` → 1200×630 PNG card.
+- `GET /og/{id}.png?v={hash}` → 1200×630 PNG profile card.
+- `GET /og/e/{id}.png?v={hash}` → 1200×630 PNG entity card; cached per entity.
 - `GET /link-preview?url={absolute http(s) url}` → JSON `{code, message, data}`
   describing **someone else's** page: the inverse direction from the routes
   above, which are about ours. The URL is attacker-controlled, so every hop is
@@ -67,7 +74,11 @@ the SPA's generic card rather than breaking anything.
 
 ## The card
 
-Identity only: the dark surface from `YourNetworkCard`'s dark variant, the
+Every card shares one frame (surface, wash, wordmark). Entity kinds live in
+`src/cards/` — one module per kind, dispatched in `cards::build`; note, article
+and calendar cards add an author strip.
+
+The profile card is identity only: the dark surface from `YourNetworkCard`'s dark variant, the
 brand wordmark, the avatar, the display name and nip05.
 
 **No score.** The card shows no verification score, tier or coin, and neither
@@ -159,10 +170,11 @@ container; the caches are in-memory, so restarting is what resets them.
 | `PROVISIONAL_TTL_SECS` | `60` | TTL when no kind-0 was found |
 | `HTML_CACHE_MAX_AGE` | `300` | meta HTML `Cache-Control` |
 | `IMAGE_CACHE_MAX_AGE` | `31536000` | card `Cache-Control`, immutable |
-| `FETCH_TIMEOUT_SECS` | `3` | per upstream call |
+| `FETCH_TIMEOUT_SECS` | `4` | per upstream call; covers a ~3.7 s cold relay read |
 | `AVATAR_TIMEOUT_SECS` | `5` | avatar image fetch |
 | `AVATAR_MAX_BYTES` | `5242880` (5 MB) | body cap before decode |
-| `REQUEST_DEADLINE_SECS` | `4` | whole-request budget |
+| `REQUEST_DEADLINE_SECS` | `4` | profile card budget; an entity card gets 2 × fetch + retry delay + max(fetch, this) |
+| `ENTITY_RETRY_DELAY_MS` | `1500` | pause before the one re-read of an entity the relay lacked |
 | `LINK_PREVIEW_TIMEOUT_SECS` | `3` | per redirect hop |
 | `LINK_PREVIEW_DEADLINE_SECS` | `5` | whole link-preview budget; must fit the router's |
 | `LINK_PREVIEW_MAX_BYTES` | `512000` | body cap; over this the page is truncated |
@@ -180,6 +192,7 @@ container; the caches are in-memory, so restarting is what resets them.
 | `MAX_CONCURRENT_RENDERS` | `32` | in-flight card renders; queues past this |
 | `ASSETS_DIR` | `assets` | bundled fonts |
 | `FONT_FAMILY` | `Figtree` | must match a family in `ASSETS_DIR` |
+| `PLACE_CONCEPT` | UI's `views.place` (`39998:b83a…:food-and-drink-places`) | DList items (39999/9999) with this `z` get a place card |
 
 `APP_BASE_URL` is the whole story for URL generation: the request's `Host`
 header is never read. A forged `Host: evil.com` therefore cannot put an attacker
@@ -205,7 +218,7 @@ curl -s localhost:8080/og/$NPUB.png -o card.png
 
 ## Routing (who reaches this service)
 
-The UI pod's own nginx sends crawler User-Agents on `/p/*` and `/s/*` here (the
-latter matched case-insensitively), and all of `/og/*` for everyone. Deliberately not the ingress: staging and prod share a
+The UI pod's own nginx sends crawler User-Agents on `/p/*`, `/e/*` and `/s/*` here (the
+last matched case-insensitively), and all of `/og/*` for everyone. Deliberately not the ingress: staging and prod share a
 cluster, so a map in the shared controller config would carry prod blast radius.
 See [`deploy/README.md`](deploy/README.md); the reasoning is in [`CONTEXT.md`](CONTEXT.md).
