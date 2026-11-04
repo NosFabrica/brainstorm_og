@@ -112,25 +112,50 @@ pub async fn render_entity(state: &AppState, card: &EntityCard) -> Result<Vec<u8
     rasterize(state, frame(&format!("{body}\n{strip}"))).await
 }
 
+/// Loads the bundled faces in file-name order: resvg falls back in load order, and `read_dir`'s isn't fixed.
+pub fn load_fonts(db: &mut usvg::fontdb::Database, dir: &str) {
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            matches!(
+                p.extension().and_then(|e| e.to_str()),
+                Some("ttf" | "otf" | "ttc" | "otc")
+            )
+        })
+        .collect();
+    files.sort();
+    for f in files {
+        if let Err(e) = db.load_font_file(&f) {
+            tracing::warn!(file = %f.display(), error = %e, "font not loaded");
+        }
+    }
+}
+
+type FontData = std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>;
+
 /// The bundled faces in resvg's fallback order (primary, then the rest as loaded), for measuring text before layout.
 pub struct Metrics {
-    faces: Vec<(Vec<u8>, u32)>,
+    faces: Vec<(FontData, u32)>,
 }
 
 impl Metrics {
-    pub fn load(db: &usvg::fontdb::Database, family: &str) -> Option<Self> {
+    /// Shares fontdb's own mapping of each file, so measuring holds no second copy of the fonts.
+    pub fn load(db: &mut usvg::fontdb::Database, family: &str) -> Option<Self> {
         let primary = db.query(&usvg::fontdb::Query {
             families: &[usvg::fontdb::Family::Name(family)],
             ..Default::default()
         })?;
-        let rest: Vec<_> = db
-            .faces()
-            .map(|f| f.id)
-            .filter(|&id| id != primary)
+        let ids: Vec<_> = std::iter::once(primary)
+            .chain(db.faces().map(|f| f.id).filter(|&id| id != primary))
             .collect();
-        let faces = std::iter::once(primary)
-            .chain(rest)
-            .map(|id| db.with_face_data(id, |data, index| (data.to_vec(), index)))
+        let faces = ids
+            .into_iter()
+            // SAFETY: maps the bundled font files read-only, as fontdb already does on every
+            // render; nothing rewrites them while the process runs (read-only image).
+            .map(|id| unsafe { db.make_shared_face_data(id) })
             .collect::<Option<Vec<_>>>()?;
         Some(Metrics { faces })
     }
@@ -140,7 +165,7 @@ impl Metrics {
             base: self
                 .faces
                 .iter()
-                .filter_map(|(data, index)| ttf_parser::Face::parse(data, *index).ok())
+                .filter_map(|(data, index)| ttf_parser::Face::parse((**data).as_ref(), *index).ok())
                 .collect(),
             weighted: Default::default(),
         }
@@ -181,17 +206,36 @@ impl Measurer<'_> {
 }
 
 /// In ems. A char no face has is drawn as the primary's missing-glyph box.
+/// Faces picked as usvg does: the primary, then for the first char still missing the first unused face
+/// that has it, which takes every missing char it has; stops at a char no face has.
 fn advance(faces: &[ttf_parser::Face], text: &str) -> f32 {
     let em = |f: &ttf_parser::Face, g| {
         f.glyph_hor_advance(g).unwrap_or(0) as f32 / f.units_per_em() as f32
     };
-    text.chars()
-        .map(|c| {
-            faces
-                .iter()
-                .find_map(|f| f.glyph_index(c).map(|g| em(f, g)))
-                .or_else(|| faces.first().map(|f| em(f, ttf_parser::GlyphId(0))))
-                .unwrap_or(0.6)
+    let chars: Vec<char> = text.chars().collect();
+    let mut by: Vec<Option<(usize, ttf_parser::GlyphId)>> = vec![None; chars.len()];
+    let mut used = vec![false; faces.len()];
+    let mut next = (!faces.is_empty()).then_some(0);
+    while let Some(fi) = next {
+        used[fi] = true;
+        for (slot, c) in by.iter_mut().zip(&chars) {
+            if slot.is_none() {
+                *slot = faces[fi].glyph_index(*c).map(|g| (fi, g));
+            }
+        }
+        next = chars
+            .iter()
+            .zip(&by)
+            .find(|(_, b)| b.is_none())
+            .and_then(|(c, _)| {
+                (0..faces.len()).find(|&j| !used[j] && faces[j].glyph_index(*c).is_some())
+            });
+    }
+    by.iter()
+        .map(|b| match (b, faces.first()) {
+            (Some((fi, g)), _) => em(&faces[*fi], *g),
+            (None, Some(f)) => em(f, ttf_parser::GlyphId(0)),
+            (None, None) => 0.6,
         })
         .sum()
 }
@@ -479,14 +523,20 @@ fn avatar_block(family: &str, avatar_png: Option<&[u8]>, name: &str) -> String {
 }
 
 /// Drop control characters and bidi overrides — an RTL override in a display
-/// name can visually reorder the rest of the card.
+/// name can visually reorder the rest of the card — and flag emoji, which
+/// resvg can't shape (tofu, and it breaks fallback for the rest of the line).
 pub fn sanitize(s: &str) -> String {
     s.chars()
         .filter(|c| {
             !c.is_control()
                 && !matches!(
                     *c,
-                    '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}'
+                    '\u{202A}'..='\u{202E}'
+                        | '\u{2066}'..='\u{2069}'
+                        | '\u{200E}'
+                        | '\u{200F}'
+                        | '\u{1F1E6}'..='\u{1F1FF}'
+                        | '\u{E0020}'..='\u{E007F}'
                 )
         })
         .collect::<String>()
@@ -543,6 +593,12 @@ mod tests {
         assert_eq!(sanitize("  a   b  "), "a b");
         // Ordinary text, including emoji and CJK, is untouched.
         assert_eq!(sanitize("Alice 🌻 佐藤"), "Alice 🌻 佐藤");
+        // Flags (regional-indicator pairs, tag sequences) go; the rest of the line stays.
+        assert_eq!(sanitize("Tokyo 🇯🇵JP/jp 🇧🇷 x"), "Tokyo JP/jp x");
+        assert_eq!(
+            sanitize("a 🏴\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F} b"),
+            "a 🏴 b"
+        );
     }
 
     #[test]
@@ -552,8 +608,27 @@ mod tests {
 
     fn fonts() -> usvg::fontdb::Database {
         let mut db = usvg::fontdb::Database::new();
-        db.load_fonts_dir("assets");
+        load_fonts(&mut db, "assets");
         db
+    }
+
+    #[test]
+    fn bundled_fonts_cover_cyrillic_and_greek() {
+        let db = fonts();
+        for c in "Їжак ґанок є і ў ђ љ ӂ қ ә Ελληνικά ΐ"
+            .chars()
+            .filter(|c| !c.is_whitespace())
+        {
+            let has = |id| {
+                db.with_face_data(id, |d, i| {
+                    ttf_parser::Face::parse(d, i).is_ok_and(|f| f.glyph_index(c).is_some())
+                })
+            };
+            assert!(
+                db.faces().any(|f| has(f.id) == Some(true)),
+                "no face has {c}"
+            );
+        }
     }
 
     /// Ink width as resvg lays the line out. Long lines make side bearings negligible.
@@ -573,13 +648,15 @@ mod tests {
 
     #[test]
     fn measuring_matches_the_rendered_width_across_scripts_and_weights() {
-        let db = fonts();
-        let m = Metrics::load(&db, "Figtree").unwrap();
+        let mut db = fonts();
+        let m = Metrics::load(&mut db, "Figtree").unwrap();
         for text in [
             "The quick brown fox jumps over the lazy dog",
             "Съешь же ещё этих мягких французских булок",
             "いろはにほへと ちりぬるを わかよたれそ",
             "Café 東京 Москва",
+            "Їжак ґанок є і Київ Ελληνικά",
+            "東京 Їжак ґанок є і Київ",
         ] {
             for weight in [400, 600, 700] {
                 let line = [text; 4].join(" ");

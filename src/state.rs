@@ -52,7 +52,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(config: Config) -> anyhow::Result<Self> {
         let mut db = fontdb::Database::new();
-        db.load_fonts_dir(&config.assets_dir);
+        crate::render::load_fonts(&mut db, &config.assets_dir);
 
         // No `load_system_fonts()` fallback on purpose — it kept a fontless
         // build alive, rendering every card blank. CONTEXT.md.
@@ -80,7 +80,7 @@ impl AppState {
                 available
             );
         }
-        let metrics = crate::render::Metrics::load(&db, &config.font_family)
+        let metrics = crate::render::Metrics::load(&mut db, &config.font_family)
             .context("loading font metrics")?;
         tracing::info!(
             font_family = %config.font_family,

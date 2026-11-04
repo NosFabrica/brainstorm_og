@@ -45,8 +45,9 @@ pub struct Config {
     ///   cache ceilings (64 png + 16 preview
     ///     + 16 map tiles) .....................  98 MB
     ///   runtime floor .........................  25 MB
-    ///   font copies for measuring .............  20 MB
-    ///                                    peak  ~ 407 MB of 512Mi
+    ///                                    peak  ~ 387 MB of 512Mi
+    ///
+    /// Fonts (~22 MB) are file-mapped once, shared by resvg and measuring.
     ///
     /// The 32 MB is a decode ceiling reached only by a maximal source image:
     /// eight concurrent renders with no avatar moved measured RSS by nothing.
