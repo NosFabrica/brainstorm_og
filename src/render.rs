@@ -480,7 +480,7 @@ fn author_strip(family: &str, name: &str, avatar_png: Option<&[u8]>) -> String {
 /// The tagline slot.
 ///
 /// Deliberately a single seam: the copy decision (one line vs. a list keyed by
-/// pubkey vs. per-tier wording) is still open, and whatever it lands on, the
+/// pubkey) is still open, and whatever it lands on, the
 /// result must be STABLE for a given card — an unstable tagline would desync
 /// from the `?v=` content hash and make the image URL lie.
 fn tagline_for(_card: &Card) -> &'static str {
