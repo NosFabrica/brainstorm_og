@@ -398,7 +398,7 @@ mod tests {
     const EPOCH: &str = "test-epoch";
     use crate::data::{Overview, ProfileMeta};
 
-    fn card_with(about: Option<&str>, influence: Option<f64>) -> Card {
+    fn card_with(about: Option<&str>) -> Card {
         Card {
             hex: "a".repeat(64),
             meta: ProfileMeta {
@@ -407,10 +407,8 @@ mod tests {
                 ..Default::default()
             },
             overview: Some(Overview {
-                influence,
                 followers: 12,
                 following: 34,
-                tier: Some("high".into()),
             }),
             provisional: false,
         }
@@ -433,29 +431,19 @@ mod tests {
     #[test]
     fn description_prefers_about_then_stats() {
         assert_eq!(
-            meta_description(&card_with(Some("  hello   world "), Some(0.4))),
+            meta_description(&card_with(Some("  hello   world "))),
             "hello world"
         );
         // Whitespace-only `about` must fall through, not render blank.
-        let s = meta_description(&card_with(Some("   "), Some(0.4)));
+        let s = meta_description(&card_with(Some("   ")));
         assert!(s.contains("12 followers"), "got {s}");
         assert!(s.contains("34 following"), "got {s}");
-
-        // The score is never published — not on the card, not here.
-        for c in [card_with(None, Some(0.98)), card_with(None, None)] {
-            let s = meta_description(&c).to_lowercase();
-            assert!(
-                !s.contains("score"),
-                "score leaked into the description: {s}"
-            );
-            assert!(!s.contains("98"), "score leaked into the description: {s}");
-        }
     }
 
     #[test]
     fn image_url_carries_the_content_hash() {
         let st_cfg = crate::config::Config::from_env();
-        let card = card_with(None, Some(0.42));
+        let card = card_with(None);
         // Build the URL the same way the template does.
         let url = format!(
             "{}/og/{}.png?v={}",
@@ -464,8 +452,5 @@ mod tests {
             card.version(EPOCH)
         );
         assert!(url.contains("?v="));
-        // A differing score leaves it alone — the card does not draw one.
-        let other = card_with(None, Some(0.55));
-        assert_eq!(card.version(EPOCH), other.version(EPOCH));
     }
 }

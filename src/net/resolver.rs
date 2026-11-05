@@ -1,5 +1,5 @@
-//! Address filtering at DNS-resolution time, for the client that fetches
-//! third-party pages.
+//! Address filtering at DNS-resolution time, for the clients that fetch
+//! attacker-controlled URLs (third-party pages, avatars and card images).
 //!
 //! `validate_and_resolve` judges a host's addresses *before* the connection.
 //! Between that check and the socket, a name is free to answer differently —

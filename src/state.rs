@@ -15,13 +15,12 @@ pub struct AppState {
     pub config: Arc<Config>,
     /// Trusted destinations (the overview API). Follows redirects.
     pub http: reqwest::Client,
-    /// Attacker-controlled avatar URLs. No redirects: one would bypass the
-    /// pre-connect address check.
+    /// Attacker-controlled image URLs (avatars, card images). No redirects: one
+    /// would bypass the pre-connect address check. Its resolver refuses reserved
+    /// addresses at dial time, so a name can't rebind between check and connect.
     pub avatar_http: reqwest::Client,
-    /// Third-party pages named in notes. Same no-redirect reasoning as
-    /// `avatar_http`, plus an honest bot identity we never disguise — and,
-    /// unlike `avatar_http`, a resolver that refuses reserved addresses at
-    /// resolution time rather than only before the connection.
+    /// Third-party pages named in notes. Same no-redirect reasoning and resolver
+    /// as `avatar_http`, plus an honest bot identity we never disguise.
     pub preview_http: reqwest::Client,
     /// The tiles server only: ours, from config, so redirects are refused and nothing else is dialled.
     pub tiles_http: reqwest::Client,
@@ -95,6 +94,7 @@ impl AppState {
         let avatar_http = reqwest::Client::builder()
             .user_agent("brainstorm-og/0.1")
             .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(crate::net::resolver::system(config.reserved_policy()))
             .build()
             .context("building avatar client")?;
 
