@@ -98,6 +98,26 @@ async fn the_deployed_preview_client_refuses_a_name_that_resolves_to_loopback() 
     );
 }
 
+/// The avatar client fetches attacker-controlled URLs too (profile pictures,
+/// card images), so it needs the same resolver.
+#[tokio::test]
+async fn the_deployed_avatar_client_refuses_a_name_that_resolves_to_loopback() {
+    let addr = stub().await;
+    let url = format!("http://localhost:{}/full", addr.port());
+    assert!(
+        reqwest::Client::new().get(&url).send().await.is_ok(),
+        "the stub was unreachable for unrelated reasons"
+    );
+
+    let mut config = test_config();
+    config.allow_loopback_preview_targets = false;
+    let st = AppState::new(config).expect("fonts must load from assets/");
+    assert!(
+        st.avatar_http.get(&url).send().await.is_err(),
+        "avatar_http dialled a name resolving to loopback"
+    );
+}
+
 fn test_config() -> Config {
     common::stub_config()
 }
