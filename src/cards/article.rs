@@ -1,4 +1,7 @@
 //! Article card (kind 30023): title, summary, cover image; author strip.
+//!
+//! Also the card for any other addressable event that carries a `title` tag
+//! (live streams, videos, listings, …): the same three tags say what it is.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hash;
@@ -9,6 +12,9 @@ use crate::event::Event;
 use crate::nip19;
 use crate::render::{self, INK, MUTED};
 use crate::state::AppState;
+
+/// NIP-23 long-form. The only kind this card describes with `article:` properties.
+pub const LONG_FORM: u32 = 30023;
 
 const TITLE_SIZES: [f32; 6] = [56.0, 52.0, 48.0, 44.0, 40.0, 36.0];
 const TITLE_LH: f32 = 1.15;
@@ -123,31 +129,43 @@ pub async fn build(st: &AppState, ev: &Event) -> Result<Built, Skip> {
     let image = ev.tag("image").and_then(super::web_url);
     let author = super::author(st, &ev.pubkey).await;
 
+    // Only an article claims `article:` properties; anything else is a website.
+    let long_form = ev.kind == LONG_FORM;
+    // Only an article's content is prose to quote. Other addressable kinds keep
+    // NIP-04/44 ciphertext (a NIP-51 set's private items) or JSON there.
     let description = summary
         .clone()
-        .or_else(|| note::text(&ev.content, |_| None).map(|t| render::sanitize(&t)))
+        .or_else(|| {
+            long_form
+                .then(|| note::text(&ev.content, |_| None))
+                .flatten()
+                .map(|t| render::sanitize(&t))
+        })
         .map(|d| fit::clip_words(&d, 200))
         .unwrap_or_default();
     let mut extra = vec![];
-    if let Some(npub) = nip19::npub_from_hex(&ev.pubkey) {
-        extra.push((
-            "article:author",
-            format!("{}/p/{npub}", st.config.app_base_url),
-        ));
-    }
-    if let Some(at) = ev
-        .tag("published_at")
-        .and_then(|s| iso8601(s.parse().ok()?))
-    {
-        extra.push(("article:published_time", at));
+    if long_form {
+        if let Some(npub) = nip19::npub_from_hex(&ev.pubkey) {
+            extra.push((
+                "article:author",
+                format!("{}/p/{npub}", st.config.app_base_url),
+            ));
+        }
+        if let Some(at) = ev
+            .tag("published_at")
+            .and_then(|s| iso8601(s.parse().ok()?))
+        {
+            extra.push(("article:published_time", at));
+        }
     }
 
     Ok(Built {
         meta: Meta {
             title: fit::clip_words(&title, 200),
             description,
-            og_type: "article",
+            og_type: if long_form { "article" } else { "website" },
             extra,
+            image: image.clone(),
         },
         author: Some(author),
         body: Arc::new(Article {
@@ -278,6 +296,7 @@ mod tests {
                     description: "d".into(),
                     og_type: "article",
                     extra: vec![],
+                    image: None,
                 },
                 body: Arc::new(a),
             },

@@ -1,6 +1,6 @@
 # brainstorm-og
 
-Renders the share card and crawler-visible meta tags for `/p/{id}`, `/e/{id}`
+Renders the share card and the preview meta tags for `/p/{id}`, `/e/{id}`
 and the short share links `/s/{code}` resolve to. Replaces
 `Brainstorm-UI`'s `useShareMeta.ts`, a client-side stopgap invisible to crawlers.
 
@@ -28,8 +28,8 @@ direction), card (that's the share card).
 self-corrects rather than pinning a name-less card.
 
 **Skipped card**: no card is drawn for an entity (not found, nothing to draw,
-NSFW, deleted by its author, unsupported kind); the crawler gets 404 and falls
-back to the SPA's generic card. Counterpart of the provisional card.
+NSFW, deleted by its author, unsupported kind); the route is a 404 and the
+page keeps the SPA's generic tags. Counterpart of the provisional card.
 
 **Short link / code**: `/s/{code}`, where the code stands in for an entity
 (`kind` + `key`, e.g. a profile's pubkey). `profile`, `event` and `address`
@@ -51,8 +51,12 @@ This also removed the `flagged` question entirely. Previously the card clamped
 to the unverified floor so a reported account never rendered red; now there is
 nothing to clamp.
 
-`/overview` is still called, but only for the follower and following counts in
-the meta description. The `tier` bucket it returns is ignored.
+The server is still asked for the follower and following counts, for the meta
+description of a profile without a bio, and nothing else. They come from ORE-02
+`POST /stats/pubkey`, not `/user/{hex}/overview`: the latter also works out the
+viewer-facing flagged fields, walking every edge the profile has on every call,
+which on production took 22–25 s for a large account against ORE-02's 0.5 s.
+The rank ORE-02 returns is ignored.
 
 ### Metadata comes from the search relay
 
@@ -77,6 +81,19 @@ crawler arriving on a legacy alias still consolidates onto the canonical domain.
 `prod-values.yaml` lists `brainstorm.nosfabrica.com` first for historical
 reasons, but `brainstorm.world` is canonical — so this is set explicitly, not
 inferred from list order.
+
+### An event's own picture beats our card
+
+A note that carries a photo, an article with a cover: the preview shows that
+picture, as the app does, rather than our drawing of the text. Our card is for
+events that have none.
+
+It is advertised through the UI's imgproxy, the one the app already draws
+pictures with, not as the author's URL: an original can be megabytes (WhatsApp
+drops an `og:image` past ~600 KB), AVIF or WebP (not every previewer decodes
+them), or `http://`. The proxied copy is a JPEG at most 1280 wide on our https
+origin. We still don't fetch it here; if the proxy is down, nginx redirects a
+previewer to the original.
 
 ### Image URLs are content-addressed, plus a render epoch
 
@@ -117,20 +134,44 @@ This process decodes attacker-supplied images and rasterises
 attacker-influenced text. A panic must fail one request via `CatchPanicLayer`,
 not restart the pod and drop every in-flight crawler with it.
 
-### The crawler split lives in the UI pod's nginx
+### Every visitor gets the tags; nginx includes them
+
+The UI's nginx serves its SPA page on `/p/`, `/e/` and `/s/` to every request
+and pastes this service's `/meta/` fragment into its `<head>` with SSI, the
+generic tags in `index.html` being the fallback. It used to send only
+User-Agents on a list here and the SPA to the rest; a previewer not on the list
+— a Signal-style UA, for one — got the generic card even for a profile, and
+which UAs Signal and iMessage really send isn't something we can know ahead of
+time. With the tags in every page there is no list to keep.
+
+What it costs: a person's page load now waits on the include. Bounded at 5 s in
+nginx (over the 4 s profile deadline, so our partial answer wins the race), a
+cached card in about a millisecond. So nothing is waited for that won't be
+shown: counts only for a profile page without a bio, never for an author
+strip; a missing note is remembered for a few seconds rather than re-read on
+every view; and a load nginx stopped waiting for finishes in its own task and
+is cached for the next visitor instead of being cancelled. The fragment
+carries no `<title>`: that names a person's tab, and the app's share screens
+restore the title they found on unmount.
+
+Why SSI and not this service serving the page: the SPA's `index.html` belongs to
+the UI image and changes with every deploy; nginx already has it. Whatever the
+subrequest outputs lands in `<head>` verbatim, nginx's own error pages
+included, so every error is turned into an empty 204 there and only an empty
+include uses the fallback.
+
+### The include lives in the UI pod's nginx
 
 Not the shared F5 ingress. Staging and prod are the same cluster
-(`deploy_targets.conf`), so a map in the controller config carries prod blast
-radius; `setup_ingress.sh` calls itself the single source of truth for that
-config, so a map added out-of-band is dropped on its next run; and the
-controller validates `Condition.variable` against built-in NGINX variables, so
-a custom `$is_og_bot` likely fails the CRD webhook anyway. The UI-nginx failure
-mode is reproducible with `docker run` and `curl` before anything ships.
+(`deploy_targets.conf`), so config in the controller carries prod blast
+radius, and `setup_ingress.sh` calls itself the single source of truth for that
+config, so anything added out-of-band is dropped on its next run. The UI-nginx
+failure mode is reproducible with nginx and `curl` before anything ships.
 
 Consequence worth stating: `ogPreview.enabled` and a UI image carrying the
 nginx config are independent halves. Either alone is safe — an unrouted service
-idles, an unresolvable upstream falls back to the SPA — but both are needed for
-unfurls to work and **neither reports the other missing**, because "og is
+idles, an unresolvable upstream leaves the generic tags — but both are needed
+for unfurls to work and **neither reports the other missing**, because "og is
 absent" and "og is misconfigured" are the same observable.
 
 ### The link-preview client filters addresses at DNS resolution

@@ -98,10 +98,135 @@ async fn a_note_unfurls_with_its_text_and_author() {
         "{body}"
     );
     assert_eq!(meta(&body, "og:url"), canonical);
+    // The note's own picture, not our card: through the image proxy, as a
+    // JPEG, and no size we don't know.
+    let proxied = format!("{APP}/img/insecure/media_1280/plain/https%3A%2F%2Fx.com%2Fa.png@jpg");
+    assert_eq!(meta(&body, "og:image"), proxied);
+    assert_eq!(meta(&body, "og:image:type"), "image/jpeg");
+    assert!(!body.contains("og:image:width"), "{body}");
+    assert!(body.contains(&format!(r#"name="twitter:image" content="{proxied}""#)));
+}
+
+#[tokio::test]
+async fn without_the_image_proxy_the_original_is_advertised() {
+    let relay = StubRelay::start(vec![
+        note(NOTE, "look http://x.com/a.png", json!([])),
+        kind0(ALICE, "alice"),
+    ])
+    .await;
+    let app = common::router_with(Config {
+        app_base_url: APP.into(),
+        local_relay_url: relay.url.clone(),
+        img_proxy_path: String::new(),
+        ..common::config()
+    });
+    let (status, _, body) = get_on(&app, &format!("/e/{}", nevent(NOTE))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(meta(&body, "og:image"), "http://x.com/a.png");
+    assert!(!body.contains("og:image:type"), "{body}");
+}
+
+#[tokio::test]
+async fn a_note_without_an_image_advertises_its_card() {
+    let relay = StubRelay::start(vec![note(NOTE, "hello", json!([])), kind0(ALICE, "alice")]).await;
+    let (status, _, body) = get_on(&router(&relay, None), &format!("/e/{}", nevent(NOTE))).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert!(
         meta(&body, "og:image").starts_with(&format!("{APP}/og/e/{}.png?v=", nevent(NOTE))),
         "{body}"
     );
+    assert_eq!(meta(&body, "og:image:width"), "1200");
+    assert_eq!(meta(&body, "og:image:height"), "630");
+}
+
+#[tokio::test]
+async fn an_image_only_note_unfurls_as_its_image() {
+    let relay = StubRelay::start(vec![
+        note(NOTE, "https://x.com/a.jpg", json!([])),
+        kind0(ALICE, "alice"),
+    ])
+    .await;
+    let app = router(&relay, None);
+    let (status, _, body) = get_on(&app, &format!("/e/{}", nevent(NOTE))).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(meta(&body, "og:title"), "alice on Brainstorm");
+    assert!(
+        meta(&body, "og:image").ends_with("https%3A%2F%2Fx.com%2Fa.jpg@jpg"),
+        "{body}"
+    );
+    // No words to describe it with, so no empty description either.
+    assert!(!body.contains("description"), "{body}");
+}
+
+#[tokio::test]
+async fn the_fragment_is_the_tags_alone() {
+    let relay = StubRelay::start(vec![note(NOTE, "hello", json!([])), kind0(ALICE, "alice")]).await;
+    let app = router(&relay, None);
+    let (status, _, page) = get_on(&app, &format!("/e/{}", nevent(NOTE))).await;
+    let (f_status, cache, fragment) = get_on(&app, &format!("/meta/e/{}", nevent(NOTE))).await;
+
+    assert_eq!((status, f_status), (StatusCode::OK, StatusCode::OK));
+    assert_eq!(cache, "public, max-age=300");
+    assert!(
+        fragment.starts_with("<meta name=\"description\""),
+        "{fragment}"
+    );
+    for absent in [
+        "<!doctype",
+        "<html",
+        "<head",
+        "<title",
+        "charset",
+        "viewport",
+        "<body",
+    ] {
+        assert!(
+            !fragment.to_lowercase().contains(absent),
+            "{absent} in {fragment}"
+        );
+    }
+    // Every tag the page has, the fragment has: the page is the fragment, wrapped.
+    assert!(
+        page.contains(&fragment),
+        "page:\n{page}\nfragment:\n{fragment}"
+    );
+}
+
+#[tokio::test]
+async fn fragments_skip_and_refuse_like_their_pages() {
+    let relay = StubRelay::start(vec![]).await;
+    let app = router(&relay, None);
+    let (status, _, body) = get_on(&app, &format!("/meta/e/{}", nevent(NOTE))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.is_empty(), "{body}");
+    let (status, _, body) = get_on(&app, "/meta/e/garbage").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.is_empty(), "{body}");
+}
+
+#[tokio::test]
+async fn og_accepts_a_note_id_as_well_as_og_e() {
+    let relay = StubRelay::start(vec![note(NOTE, "hello", json!([])), kind0(ALICE, "alice")]).await;
+    let app = router(&relay, None);
+    let note1 = nip19::note_from_hex(NOTE).unwrap();
+    for id in [nevent(NOTE), note1] {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/og/{id}.png"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "{id}");
+        assert_eq!(res.headers()["content-type"], "image/png");
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+    }
 }
 
 #[tokio::test]
@@ -153,6 +278,72 @@ async fn a_missing_note_is_retried_once_then_skipped_briefly() {
     relay.push(note(NOTE, "hello", json!([])));
     let (status, _, _) = get_on(&app, &format!("/e/{}", nevent(NOTE))).await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_missing_note_is_remembered_briefly_when_configured() {
+    let relay = StubRelay::start(vec![]).await;
+    let app = common::router_with(Config {
+        app_base_url: APP.into(),
+        local_relay_url: relay.url.clone(),
+        not_found_ttl_secs: 30,
+        ..common::config()
+    });
+    for _ in 0..3 {
+        let (status, _, _) = get_on(&app, &format!("/e/{}", nevent(NOTE))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+    // One read and its retry, then the answer is remembered.
+    assert_eq!(relay.filters_with("ids").len(), 2);
+}
+
+#[tokio::test]
+async fn a_load_the_caller_gives_up_on_still_lands_in_the_cache() {
+    // As nginx does when the include runs past its timeout.
+    let relay = StubRelay::start(vec![note(NOTE, "hello", json!([])), kind0(ALICE, "alice")]).await;
+    relay.stall("ids", 1); // the first read times out (1 s), the retry lands
+    let state = brainstorm_og::state::AppState::new(Config {
+        app_base_url: APP.into(),
+        local_relay_url: relay.url.clone(),
+        ..common::config()
+    })
+    .unwrap();
+    let app = brainstorm_og::build_router(state.clone());
+    let request = app.clone().oneshot(
+        Request::builder()
+            .uri(format!("/meta/e/{}", nevent(NOTE)))
+            .body(Body::empty())
+            .unwrap(),
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), request)
+            .await
+            .is_err(),
+        "the stalled read should outlast the caller"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    let key = Entity::Event { id: NOTE.into() }.key();
+    assert!(
+        matches!(state.entity_cache.get(&key).await, Some(Ok(_))),
+        "the abandoned load was cancelled instead of cached"
+    );
+    let (status, _, _) = get_on(&app, &format!("/meta/e/{}", nevent(NOTE))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(relay.filters_with("ids").len(), 2, "served from the cache");
+}
+
+#[tokio::test]
+async fn the_delete_check_is_one_read() {
+    let relay = StubRelay::start(vec![note(NOTE, "hello", json!([])), kind0(ALICE, "alice")]).await;
+    get_on(&router(&relay, None), &format!("/e/{}", nevent(NOTE))).await;
+    let kind5 = relay
+        .filters
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|f| f["kinds"] == json!([5]))
+        .count();
+    assert_eq!(kind5, 1);
 }
 
 #[tokio::test]
@@ -249,9 +440,9 @@ async fn a_failed_delete_check_caches_the_card_briefly() {
 }
 
 #[tokio::test]
-async fn media_only_and_bare_quotes_are_skipped() {
+async fn video_only_and_bare_quotes_are_skipped() {
     let quote = format!("nostr:{}", nevent(OTHER));
-    for content in ["https://x.com/a.jpg", quote.as_str()] {
+    for content in ["https://x.com/a.mp4", quote.as_str()] {
         let relay =
             StubRelay::start(vec![note(NOTE, content, json!([])), kind0(ALICE, "alice")]).await;
         assert_skipped_and_cached(relay, NOTE).await;

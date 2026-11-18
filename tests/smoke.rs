@@ -95,6 +95,26 @@ async fn profile_emits_absolute_meta_from_config() {
     assert!(body.contains(&format!("{APP}/og/{NPUB}.png?v=")), "{body}");
 }
 
+/// What the UI's nginx includes in every `/p/` page: the same tags, no document.
+#[tokio::test]
+async fn profile_fragment_is_the_page_without_its_document() {
+    let (status, _, page) = get(&format!("/p/{NPUB}")).await;
+    let (f_status, headers, fragment) = get(&format!("/meta/p/{NPUB}")).await;
+    assert_eq!((status, f_status), (StatusCode::OK, StatusCode::OK));
+    assert!(header(&headers, "content-type").starts_with("text/html"));
+    assert!(
+        fragment.contains(&format!("{APP}/og/{NPUB}.png?v=")),
+        "{fragment}"
+    );
+    assert!(!fragment.contains("<title"), "{fragment}");
+    assert!(!fragment.contains("<head"), "{fragment}");
+    assert!(page.contains(&fragment));
+
+    let (status, _, body) = get("/meta/p/not-an-npub").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.is_empty());
+}
+
 /// The Host header must never reach the output. Before this was fixed, a forged
 /// header put an attacker's origin into og:image for a Brainstorm link.
 #[tokio::test]

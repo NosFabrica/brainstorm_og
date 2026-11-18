@@ -52,31 +52,20 @@ impl ProfileMeta {
     }
 }
 
-/// Trust stats from brainstorm-server.
+/// A profile's rank and follower counts, from brainstorm-server's ORE-02.
 #[derive(Clone, Default, Debug)]
 pub struct Overview {
     pub influence: Option<f64>,
     pub followers: i64,
     pub following: i64,
-    /// The server's tier bucket, taken as truth. Bands are never re-derived here.
-    pub tier: Option<String>,
 }
 
+/// `POST /stats/pubkey` (ORE-02), the fields we read.
 #[derive(Deserialize)]
-struct OverviewEnvelope {
-    data: OverviewData,
-}
-#[derive(Deserialize)]
-struct OverviewData {
-    influence: Option<f64>,
-    #[serde(default)]
-    tier: Option<String>,
-    counts: OverviewCounts,
-}
-#[derive(Deserialize)]
-struct OverviewCounts {
-    followed_by: i64,
-    following: i64,
+struct StatsPubkey {
+    rank: Option<f64>,
+    followers: Option<i64>,
+    follows: Option<i64>,
 }
 
 /// Everything needed to render a card / meta tags for one pubkey.
@@ -130,6 +119,27 @@ impl Card {
     }
 }
 
+/// Counts found are kept like a card; a failed fetch only briefly.
+pub struct OverviewExpiry {
+    pub missing: Duration,
+    pub normal: Duration,
+}
+
+impl moka::Expiry<String, Option<Overview>> for OverviewExpiry {
+    fn expire_after_create(
+        &self,
+        _key: &String,
+        value: &Option<Overview>,
+        _now: std::time::Instant,
+    ) -> Option<Duration> {
+        Some(if value.is_some() {
+            self.normal
+        } else {
+            self.missing
+        })
+    }
+}
+
 /// Per-entry TTL so provisional cards die young.
 pub struct CardExpiry {
     pub provisional: Duration,
@@ -151,67 +161,127 @@ impl moka::Expiry<String, Card> for CardExpiry {
     }
 }
 
-/// Assemble (and cache) a profile card. `get_with` coalesces concurrent loads
-/// of the same key, so a crawler burst on one profile does one fetch.
+/// Assemble (and cache) a profile card: the kind-0 only, which is everything
+/// the card draws. `get_with` coalesces concurrent loads of the same key, so a
+/// crawler burst on one profile does one fetch.
+///
+/// The load runs in its own task. A caller that stops waiting (nginx's include
+/// timing out, a client gone) would otherwise cancel it half-done, and the next
+/// visitor would start from nothing; spawned, it finishes and lands in the cache.
 pub async fn get_card(state: &AppState, pointer: &Pointer) -> Card {
     let hex = pointer.hex.clone();
     let st = state.clone();
-
-    state
-        .card_cache
-        .get_with(hex.clone(), async move {
-            let deadline = Duration::from_secs(st.config.request_deadline_secs);
-            // Whole-request budget: partial data beats a crawler timeout.
-            let fetched = tokio::time::timeout(deadline, async {
-                tokio::join!(fetch_overview(&st, &hex), fetch_meta(&st, &hex))
-            })
-            .await;
-
-            let (overview, meta) = match fetched {
-                Ok(pair) => pair,
-                Err(_) => {
-                    tracing::warn!("card assembly for {hex} hit the {deadline:?} deadline");
-                    (None, None)
-                }
-            };
-
-            Card {
-                hex,
-                provisional: meta.is_none(),
-                meta: meta.unwrap_or_default(),
-                overview,
-            }
-        })
-        .await
+    let key = hex.clone();
+    tokio::spawn(async move {
+        let load = assemble(st.clone(), key.clone());
+        st.card_cache.get_with(key, load).await
+    })
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!("card load for {hex} failed: {e}");
+        Card {
+            hex,
+            meta: ProfileMeta::default(),
+            overview: None,
+            provisional: true,
+        }
+    })
 }
 
+async fn assemble(st: AppState, hex: String) -> Card {
+    let deadline = Duration::from_secs(st.config.request_deadline_secs);
+    // Whole-request budget: partial data beats a crawler timeout.
+    let meta = tokio::time::timeout(deadline, fetch_meta(&st, &hex))
+        .await
+        .unwrap_or_else(|_| {
+            tracing::warn!("kind-0 for {hex} hit the {deadline:?} deadline");
+            None
+        });
+    Card {
+        hex,
+        provisional: meta.is_none(),
+        meta: meta.unwrap_or_default(),
+        overview: None,
+    }
+}
+
+/// A profile page's card: [`get_card`] plus the follower counts, which stand in
+/// for a missing bio in the description (`meta_description`) and nowhere else.
+/// So they are asked for only then, never for an author strip, and waited for
+/// only within what is left of the deadline: production's `/user/{hex}/overview`
+/// took 30 s and more, which is why the counts now come from ORE-02.
+pub async fn get_profile(state: &AppState, pointer: &Pointer) -> Card {
+    let started = tokio::time::Instant::now();
+    let mut card = get_card(state, pointer).await;
+    if card.meta.about.is_none() {
+        let deadline = Duration::from_secs(state.config.request_deadline_secs);
+        let left = deadline.saturating_sub(started.elapsed());
+        card.overview = get_overview(state, &card.hex, left).await;
+    }
+    card
+}
+
+/// The counts, cached on their own (a miss briefly, as a provisional card is).
+/// Fetched in a task that outlives `wait`: a slow answer is kept for the next
+/// request rather than thrown away, and the fetch is still bounded by its own
+/// timeout.
+async fn get_overview(state: &AppState, hex: &str, wait: Duration) -> Option<Overview> {
+    let st = state.clone();
+    let key = hex.to_string();
+    let load = tokio::spawn(async move {
+        let fetch = {
+            let (st, key) = (st.clone(), key.clone());
+            async move { fetch_overview(&st, &key).await }
+        };
+        st.overview_cache.get_with(key, fetch).await
+    });
+    match tokio::time::timeout(wait, load).await {
+        Ok(Ok(overview)) => overview,
+        Ok(Err(e)) => {
+            tracing::warn!("overview load for {hex} failed: {e}");
+            None
+        }
+        Err(_) => {
+            tracing::debug!(
+                "overview for {hex} not back within {wait:?}; it finishes in the background"
+            );
+            None
+        }
+    }
+}
+
+/// The counts from ORE-02 `POST /stats/pubkey`, under the House view (no
+/// `pov`, no signer). Not `/user/{hex}/overview`: that one also counts the
+/// profile's flagged neighbours live, walking every edge it has, and on
+/// production took 22–25 s for a 121k-follower account where this took 0.5 s.
+/// We show the counts and nothing else.
 async fn fetch_overview(state: &AppState, hex: &str) -> Option<Overview> {
-    let url = format!("{}/user/{}/overview", state.config.api_base_url, hex);
+    let url = format!("{}/stats/pubkey", state.config.api_base_url);
     let resp = state
         .http
-        .get(&url)
+        .post(&url)
+        .json(&serde_json::json!({ "pubkey": hex }))
         .timeout(Duration::from_secs(state.config.fetch_timeout_secs))
         .send()
         .await
-        .map_err(|e| tracing::warn!("overview request failed for {hex}: {e}"))
+        .map_err(|e| tracing::warn!("stats request failed for {hex}: {e}"))
         .ok()?;
 
     if !resp.status().is_success() {
-        tracing::warn!("overview {hex} -> HTTP {}", resp.status());
+        tracing::warn!("stats {hex} -> HTTP {}", resp.status());
         return None;
     }
 
-    let env: OverviewEnvelope = resp
+    let stats: StatsPubkey = resp
         .json()
         .await
-        .map_err(|e| tracing::warn!("overview decode failed for {hex}: {e}"))
+        .map_err(|e| tracing::warn!("stats decode failed for {hex}: {e}"))
         .ok()?;
 
     Some(Overview {
-        influence: env.data.influence,
-        followers: env.data.counts.followed_by,
-        following: env.data.counts.following,
-        tier: env.data.tier,
+        influence: stats.rank,
+        followers: stats.followers.unwrap_or(0),
+        following: stats.follows.unwrap_or(0),
     })
 }
 
@@ -352,7 +422,6 @@ mod tests {
                 influence,
                 followers: 0,
                 following: 0,
-                tier: None,
             }),
             provisional: false,
         }

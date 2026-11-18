@@ -50,6 +50,9 @@ pub struct Meta {
     pub og_type: &'static str,
     /// Extra `<meta property=…>` pairs, e.g. `article:author`.
     pub extra: Vec<(&'static str, String)>,
+    /// The entity's own picture (a note's first image, an article's `image` tag).
+    /// When set, the page advertises it as `og:image` instead of the share card.
+    pub image: Option<String>,
 }
 
 /// An image a body wants fetched (through the avatar pipeline) before drawing.
@@ -174,13 +177,17 @@ async fn build(st: &AppState, ev: &Event) -> Result<Built, Skip> {
         30023 => Box::pin(article::build(st, ev)).await,
         calendar::DATE_KIND | calendar::TIME_KIND => Box::pin(calendar::build(st, ev)).await,
         9999 | 39999 => Box::pin(place::build(st, ev)).await,
+        // Any other addressable event that names itself: its own title, summary and image.
+        k if (30000..40000).contains(&k) => Box::pin(article::build(st, ev)).await,
         _ => Err(Skip::Unsupported),
     }
 }
 
-/// Per-entry TTL: provisional cards die young, settled cards and skips cache normally.
+/// Per-entry TTL: provisional cards die young, a not-found younger still,
+/// settled cards and skips cache normally.
 pub struct OutcomeExpiry {
     pub provisional: Duration,
+    pub not_found: Duration,
     pub normal: Duration,
 }
 
@@ -193,29 +200,52 @@ impl moka::Expiry<String, Outcome> for OutcomeExpiry {
     ) -> Option<Duration> {
         Some(match v {
             Ok(card) if card.provisional() => self.provisional,
+            Err(Skip::NotFound) => self.not_found,
             _ => self.normal,
         })
     }
 }
 
-/// Fetch, skip-check and build (cached, coalesced). A not-found is never cached.
+/// Fetch, skip-check and build (cached, coalesced).
+///
+/// A not-found is kept only for `not_found_ttl_secs`: long enough that every
+/// page view of a note the relay lacks doesn't pay the reads and the retry
+/// pause again, short enough that a just-posted one shows up.
+///
+/// The load runs in its own task, for the reason `data::get_card`'s does: the
+/// entity budget is longer than nginx waits for the include, and a caller that
+/// gives up must not cancel the load, or a slow entity is never cached.
 pub async fn get(st: &AppState, entity: &Entity) -> Outcome {
     let (s, e) = (st.clone(), entity.clone());
-    st.entity_cache
-        .try_get_with(entity.key(), async move {
-            let outcome = tokio::time::timeout(s.config.entity_deadline(), Box::pin(load(&s, &e)))
-                .await
-                .unwrap_or_else(|_| {
-                    tracing::warn!("entity {} hit the deadline", e.key());
-                    Err(Skip::NotFound)
-                });
-            match outcome {
-                Err(Skip::NotFound) => Err(()),
-                other => Ok(other),
+    tokio::spawn(async move {
+        let remember_missing = s.config.not_found_ttl_secs > 0;
+        let key = e.key();
+        let load = {
+            let s = s.clone();
+            async move {
+                let outcome =
+                    tokio::time::timeout(s.config.entity_deadline(), Box::pin(load(&s, &e)))
+                        .await
+                        .unwrap_or_else(|_| {
+                            tracing::warn!("entity {} hit the deadline", e.key());
+                            Err(Skip::NotFound)
+                        });
+                match outcome {
+                    Err(Skip::NotFound) if !remember_missing => Err(()),
+                    other => Ok(other),
+                }
             }
-        })
-        .await
-        .unwrap_or(Err(Skip::NotFound))
+        };
+        s.entity_cache
+            .try_get_with(key, load)
+            .await
+            .unwrap_or(Err(Skip::NotFound))
+    })
+    .await
+    .unwrap_or_else(|err| {
+        tracing::warn!("entity load for {} failed: {err}", entity.key());
+        Err(Skip::NotFound)
+    })
 }
 
 async fn load(st: &AppState, entity: &Entity) -> Outcome {
@@ -274,40 +304,24 @@ async fn fetch_entity(st: &AppState, entity: &Entity) -> Option<Event> {
         .max_by_key(|ev| ev.created_at)
 }
 
-/// Whether the author's kind-5 names the event (`e`) or its address (`a`); `None` if a read failed.
+/// Whether the author's kind-5 names the event (`e`) or its address (`a`); `None` if the read failed.
+///
+/// One REQ with both filters: a relay read is a connection of its own.
 async fn is_deleted(st: &AppState, ev: &Event) -> Option<bool> {
     let relay = &st.config.local_relay_url;
-    let timeout = st.config.fetch_timeout_secs;
-    let by_id = json!({ "kinds": [5], "authors": [ev.pubkey], "#e": [ev.id] });
-    let by_addr = ev
-        .address()
-        .map(|a| json!({ "kinds": [5], "authors": [ev.pubkey], "#a": [a] }));
-    let (a, b) = tokio::join!(crate::relay::fetch_events(relay, by_id, timeout), async {
-        match by_addr {
-            Some(f) => crate::relay::fetch_events(relay, f, timeout).await,
-            None => Ok(vec![]),
-        }
-    });
-    let mut failed = false;
-    for r in [a, b] {
-        match r {
-            Ok(events) => {
-                let by_author = events.iter().any(|e| {
-                    e.get("pubkey")
-                        .and_then(Value::as_str)
-                        .is_some_and(|pk| pk.eq_ignore_ascii_case(&ev.pubkey))
-                });
-                if by_author {
-                    return Some(true);
-                }
-            }
-            Err(err) => {
-                tracing::warn!("delete check for {} failed: {err}", ev.id);
-                failed = true;
-            }
-        }
+    let mut filters = vec![json!({ "kinds": [5], "authors": [ev.pubkey], "#e": [ev.id] })];
+    if let Some(a) = ev.address() {
+        filters.push(json!({ "kinds": [5], "authors": [ev.pubkey], "#a": [a] }));
     }
-    (!failed).then_some(false)
+    let events = crate::relay::fetch_events_matching(relay, filters, st.config.fetch_timeout_secs)
+        .await
+        .map_err(|err| tracing::warn!("delete check for {} failed: {err}", ev.id))
+        .ok()?;
+    Some(events.iter().any(|e| {
+        e.get("pubkey")
+            .and_then(Value::as_str)
+            .is_some_and(|pk| pk.eq_ignore_ascii_case(&ev.pubkey))
+    }))
 }
 
 /// The author strip, through the profile card path and its cache.

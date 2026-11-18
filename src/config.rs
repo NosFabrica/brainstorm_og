@@ -4,7 +4,7 @@ use std::env;
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bind_addr: String,
-    /// brainstorm-server base (overview stats). No trailing slash.
+    /// brainstorm-server base (ORE-02 follower counts). No trailing slash.
     pub api_base_url: String,
     /// This environment's canonical origin, no trailing slash. Every absolute
     /// URL we emit comes from here; the request `Host` is never read. CONTEXT.md.
@@ -20,6 +20,15 @@ pub struct Config {
     pub image_cache_max_age: u64,
     /// TTL for provisional cards, so they self-correct quickly.
     pub provisional_ttl_secs: u64,
+    /// How long an entity the relay doesn't have is remembered as missing.
+    /// Short, because a just-posted note may reach the relay seconds later; not
+    /// zero, because every page view of a missing note would otherwise pay the
+    /// reads and the retry pause again. 0 never remembers it.
+    pub not_found_ttl_secs: u64,
+    /// The UI's image proxy (imgproxy), as a path under `app_base_url`. An
+    /// entity's own picture is advertised through it, resized and as JPEG, so
+    /// every previewer can fetch it. Empty advertises the original URL.
+    pub img_proxy_path: String,
     pub fetch_timeout_secs: u64,
     /// Pause before re-reading an entity the relay lacked: the first crawler hit often lands seconds after posting.
     pub entity_retry_delay_ms: u64,
@@ -172,6 +181,12 @@ impl Config {
             html_cache_max_age: parse("HTML_CACHE_MAX_AGE", 300),
             image_cache_max_age: parse("IMAGE_CACHE_MAX_AGE", 31_536_000),
             provisional_ttl_secs: parse("PROVISIONAL_TTL_SECS", 60),
+            not_found_ttl_secs: parse("NOT_FOUND_TTL_SECS", 15),
+            // Set but empty turns the proxy off, so not `var`, which reads empty as unset.
+            img_proxy_path: env::var("IMG_PROXY_PATH")
+                .unwrap_or_else(|_| "/img".into())
+                .trim_end_matches('/')
+                .to_string(),
             fetch_timeout_secs: parse("FETCH_TIMEOUT_SECS", 4),
             entity_retry_delay_ms: parse("ENTITY_RETRY_DELAY_MS", 1500),
             avatar_timeout_secs: parse("AVATAR_TIMEOUT_SECS", 5),
