@@ -211,6 +211,7 @@ pub fn read(ev: &Event, concept: &str) -> Result<(Place, Meta), Skip> {
         description,
         og_type: "website",
         extra: vec![],
+        image: None,
     };
     Ok((
         Place {

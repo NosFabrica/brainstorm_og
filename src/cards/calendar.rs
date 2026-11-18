@@ -48,6 +48,7 @@ impl Calendar {
             description: parts.join(" · "),
             og_type: "website",
             extra: vec![],
+            image: self.image.clone(),
         }
     }
 }
@@ -471,6 +472,7 @@ mod tests {
                     description: String::new(),
                     og_type: "website",
                     extra: vec![],
+                    image: None,
                 },
                 body: Arc::new(event(e).unwrap()),
             },

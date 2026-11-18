@@ -1,17 +1,20 @@
 # brainstorm-og
 
-Share-card service for Brainstorm profiles. When a crawler (Slack, X, Discord,
-Telegram, Facebook, …) fetches a profile URL, it gets per-profile `<meta>` tags
-and a generated card image — instead of the SPA's generic static card. Humans
-are never routed to those; they keep getting the React app unchanged.
+Share-card service for Brainstorm profiles, notes and other events. Every
+request for a share page (`/p/`, `/e/`, `/s/`) gets that page's own `<meta>`
+tags — the UI's nginx serves its SPA and includes them in its `<head>` — and
+`og:image` points at a generated card or the event's own picture, instead of
+the SPA's generic static card. Nobody is sorted by User-Agent: a person gets the
+same React app, with tags they never see; a link previewer gets the tags,
+whatever it calls itself.
 
 It also serves **link previews** (`/link-preview`) for the UI: the title,
 description and image of a third-party page linked in a note, which the browser
 can't read itself. See `CONTEXT.md` for why that lives here.
 
-The app has no hard dependency on it: the UI's nginx falls back to serving the
-SPA when this service is absent or down, so removing it degrades unfurls back to
-the SPA's generic card rather than breaking anything.
+The app has no hard dependency on it: the UI's nginx keeps the SPA's generic
+tags when this service is absent, down, slow or has nothing to say, so removing
+it degrades unfurls back to the generic card rather than breaking anything.
 
 ## Routes
 
@@ -21,11 +24,20 @@ the SPA's generic card rather than breaking anything.
 - `GET /profile/{id}` → the same, kept only for links already in the wild.
   `og:url` and `canonical` still point at `/p/`.
 - `GET /e/{nevent|note|naddr}` → meta tags for a **note** (kind 1), **article**
-  (30023), **calendar event** (31922/31923) or **place** (a 39999/9999 DList
-  item under `PLACE_CONCEPT`); other kinds are 404. Read from the search relay
+  (30023), **calendar event** (31922/31923), **place** (a 39999/9999 DList
+  item under `PLACE_CONCEPT`), or **any other addressable event** (30000–39999)
+  with a `title` tag — a live stream, a video, a listing — described by its own
+  `title`, `summary` and `image` like an article, but `og:type` `website` and no
+  `article:` properties; other kinds are 404. A note's title is
+  "<author> on Brainstorm" and its description its text, cut, with `nostr:`
+  mentions as names. `og:image` is the event's own picture when it has one — a
+  note's first image (by extension, or an `imeta` tag with `m image/…`), an
+  article's or event's `image` tag — and the generated card otherwise; only the
+  card states `og:image:width`/`height`/`type`. A note that is only an image is
+  not skipped: it unfurls as that image, with no description. Read from the search relay
   by id or coordinate, one retry after `ENTITY_RETRY_DELAY_MS` on a miss.
   Skipped (404) when not found (`max-age=60`, not cached), NSFW, deleted by its
-  author, or empty after stripping. A failed delete check still draws the card
+  author, or empty after stripping (no text and no image). A failed delete check still draws the card
   but caches it like a provisional one. `canonical` is the hint-free `/e/` link.
 - `GET /s/{code}` → the card for a **short share link**, resolved via the API
   and cached. `profile` codes render the `/p/` card (canonical `/p/`), `event`
@@ -33,8 +45,15 @@ the SPA's generic card rather than breaking anything.
   and unresolvable ones are 404.
   Registered under `/S/` too: the QR payload is uppercase, and nginx proxies the
   URI unchanged.
-- `GET /og/{id}.png?v={hash}` → 1200×630 PNG profile card.
+- `GET /meta/p/{id}`, `/meta/e/{id}`, `/meta/s/{code}` → the same tags as the
+  route without `/meta`, and nothing else: no doctype, `<head>`, charset or
+  `<title>`. What the UI's nginx includes in its SPA page (see Routing); same
+  status codes, and a skip or bad id has an empty body. `<title>` is left out
+  because the page's title names a person's browser tab.
+- `GET /og/{id}.png?v={hash}` → 1200×630 PNG profile card. A `nevent`/`note`/
+  `naddr` here gets the entity card, as at `/og/e/`.
 - `GET /og/e/{id}.png?v={hash}` → 1200×630 PNG entity card; cached per entity.
+  The one pages advertise. An image-only note's card draws its image.
 - `GET /link-preview?url={absolute http(s) url}` → JSON `{code, message, data}`
   describing **someone else's** page: the inverse direction from the routes
   above, which are about ours. The URL is attacker-controlled, so every hop is
@@ -98,7 +117,10 @@ with a different audience and is free to look different.
   one is plain recall. `nprofile` relay hints are parsed but never dialled.
 - **Relationship counts**: one cached call to
   `GET {API_BASE_URL}/user/{hex}/overview`, used solely for the follower and
-  following numbers in the meta description. The score it also returns is
+  following numbers in the meta description of a profile with no `about`.
+  Started alongside the kind-0 but waited for only when the kind-0 has no
+  `about` (production's has taken 30–70 s; staging's ~3 s). Past the deadline
+  the card keeps the kind-0 it already has. The score it also returns is
   ignored.
 
 Everything is cached in a bounded in-memory LRU (no disk).
@@ -139,7 +161,9 @@ dominated by network round-trips, not by anything this service computes.
 
 Reading that: of a ~2 s cold meta request, roughly 100 ms is ours. The rest is
 the kind-0 lookup and the overview call, which run concurrently, so the cost is
-the slower of the two. The card is cheaper than the meta HTML only because the
+the slower of the two — and the overview is waited for only when the profile
+has no `about` (2026-11-18, production overview at 30–70 s: a cold profile with
+a bio in ~0.3 s, where every cold profile had taken the full 4 s deadline). The card is cheaper than the meta HTML only because the
 meta request has already populated the card cache; a card fetched first pays the
 same upstream cost. Avatar fetching adds ~0.4 s against an arbitrary remote host
 and is the single largest component of a cold card once metadata is cached.
@@ -215,13 +239,18 @@ API_BASE_URL=https://brainstormserver-staging.nosfabrica.com \
 cargo run
 
 NPUB=npub1...
-curl -s -A Twitterbot/1.0 localhost:8080/p/$NPUB | grep og:
+curl -s localhost:8080/p/$NPUB | grep og:
+curl -s localhost:8080/meta/p/$NPUB          # what nginx includes
 curl -s localhost:8080/og/$NPUB.png -o card.png
 ```
 
 ## Routing (who reaches this service)
 
-The UI pod's own nginx sends crawler User-Agents on `/p/*`, `/e/*` and `/s/*` here (the
-last matched case-insensitively), and all of `/og/*` for everyone. Deliberately not the ingress: staging and prod share a
-cluster, so a map in the shared controller config would carry prod blast radius.
-See [`deploy/README.md`](deploy/README.md); the reasoning is in [`CONTEXT.md`](CONTEXT.md).
+The UI pod's own nginx serves its SPA page on `/p/{id}`, `/e/{id}` and
+`/s/{code}` (the last matched case-insensitively) to **every** request, and
+includes `/meta/…` from here in its `<head>` (SSI). On a 400, 404, 500, a
+timeout (5 s) or no service, the include is empty and the page keeps its
+generic tags. All of `/og/*` is proxied here for everyone. Deliberately not the
+ingress: staging and prod share a cluster, so config in the shared controller
+would carry prod blast radius. See [`deploy/README.md`](deploy/README.md); the
+reasoning is in [`CONTEXT.md`](CONTEXT.md).

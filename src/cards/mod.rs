@@ -50,6 +50,9 @@ pub struct Meta {
     pub og_type: &'static str,
     /// Extra `<meta property=…>` pairs, e.g. `article:author`.
     pub extra: Vec<(&'static str, String)>,
+    /// The entity's own picture (a note's first image, an article's `image` tag).
+    /// When set, the page advertises it as `og:image` instead of the share card.
+    pub image: Option<String>,
 }
 
 /// An image a body wants fetched (through the avatar pipeline) before drawing.
@@ -174,6 +177,8 @@ async fn build(st: &AppState, ev: &Event) -> Result<Built, Skip> {
         30023 => Box::pin(article::build(st, ev)).await,
         calendar::DATE_KIND | calendar::TIME_KIND => Box::pin(calendar::build(st, ev)).await,
         9999 | 39999 => Box::pin(place::build(st, ev)).await,
+        // Any other addressable event that names itself: its own title, summary and image.
+        k if (30000..40000).contains(&k) => Box::pin(article::build(st, ev)).await,
         _ => Err(Skip::Unsupported),
     }
 }

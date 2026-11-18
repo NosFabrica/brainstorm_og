@@ -1,13 +1,15 @@
 # Deploying brainstorm-og
 
 The service is a passive backend: it renders cards for whoever asks. Nothing
-reaches it until something routes crawler traffic its way, and that routing
-lives in **the UI container's nginx**, not here and not in the ingress.
+reaches it until something routes share pages its way, and that routing lives
+in **the UI container's nginx**, not here and not in the ingress.
 
 ## Where the routing lives, and why
 
-`Brainstorm-UI/nginx.conf` carries the User-Agent map and the `/p/` and `/og/`
-locations. That file is the single source of truth for the split — this repo
+`Brainstorm-UI/nginx.conf` carries the `/p/`, `/e/`, `/s/` locations (the SPA
+with an SSI include of `/__og/meta/…`), the internal `/__og/` location that
+proxies here, and `/og/`; `Brainstorm-UI/client/index.html` carries the
+fallback block and the include. That file is the single source of truth for the split — this repo
 deliberately keeps no copy, because two copies drift.
 
 It is not at the F5 ingress because **staging and prod share a cluster**
@@ -71,17 +73,23 @@ compose service name.
 
 ```bash
 NPUB=npub1...
+NEVENT=nevent1...
 H=<ui-host>
 
-# A crawler gets meta tags...
-curl -s -A "Twitterbot/1.0" https://$H/p/$NPUB | grep -E 'og:image|og:url'
+# Every visitor gets the page's own tags, whatever its User-Agent...
+for UA in "Twitterbot/1.0" "Signal-Android/7" "Mozilla/5.0 Safari/605.1.15"; do
+  curl -s -A "$UA" https://$H/p/$NPUB | grep -E 'og:title|og:image"'
+done
 
-# ...a human still gets the SPA...
+# ...in the SPA page itself...
 curl -s https://$H/p/$NPUB | grep -c '<div id="root">'
 
-# ...and sub-paths are NOT swallowed. These must return the SPA:
-curl -s -A "Twitterbot/1.0" https://$H/p/$NPUB/hops      | grep -c 'id="root"'
-curl -s -A "Twitterbot/1.0" https://$H/p/$NPUB/followers | grep -c 'id="root"'
+# ...and sub-paths are NOT included. These keep the generic tags:
+curl -s https://$H/p/$NPUB/hops      | grep 'og:title'
+curl -s https://$H/p/$NPUB/followers | grep 'og:title'
+
+# A note: its own first image, or its card.
+curl -s https://$H/e/$NEVENT | grep -E 'og:title|og:description|og:image"'
 
 # The card itself, and its content-addressed URL:
 curl -s https://$H/p/$NPUB | grep -o 'og/[^"]*'   # .../og/<id>.png?v=<hash>
@@ -100,6 +108,6 @@ use a fresh npub per attempt.
 
 ## Disable
 
-Set `ogPreview.enabled: false`. `/p/*` serves the SPA exactly as before — the
-nginx config's `error_page 502 503 504 = @spa` covers the service being gone,
-so no UI change is needed to turn it off.
+Set `ogPreview.enabled: false`. `/p/*` serves the SPA with its generic tags —
+the include's `error_page … = @share_meta_none` turns the service being gone
+into an empty include, so no UI change is needed to turn it off.

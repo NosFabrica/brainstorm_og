@@ -98,10 +98,110 @@ async fn a_note_unfurls_with_its_text_and_author() {
         "{body}"
     );
     assert_eq!(meta(&body, "og:url"), canonical);
+    // The note's own picture, not our card — and no size we don't know.
+    assert_eq!(meta(&body, "og:image"), "https://x.com/a.png");
+    assert!(!body.contains("og:image:width"), "{body}");
+    assert!(body.contains(r#"name="twitter:image" content="https://x.com/a.png""#));
+}
+
+#[tokio::test]
+async fn a_note_without_an_image_advertises_its_card() {
+    let relay = StubRelay::start(vec![note(NOTE, "hello", json!([])), kind0(ALICE, "alice")]).await;
+    let (status, _, body) = get_on(&router(&relay, None), &format!("/e/{}", nevent(NOTE))).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert!(
         meta(&body, "og:image").starts_with(&format!("{APP}/og/e/{}.png?v=", nevent(NOTE))),
         "{body}"
     );
+    assert_eq!(meta(&body, "og:image:width"), "1200");
+    assert_eq!(meta(&body, "og:image:height"), "630");
+}
+
+#[tokio::test]
+async fn an_image_only_note_unfurls_as_its_image() {
+    let relay = StubRelay::start(vec![
+        note(NOTE, "https://x.com/a.jpg", json!([])),
+        kind0(ALICE, "alice"),
+    ])
+    .await;
+    let app = router(&relay, None);
+    let (status, _, body) = get_on(&app, &format!("/e/{}", nevent(NOTE))).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(meta(&body, "og:title"), "alice on Brainstorm");
+    assert_eq!(meta(&body, "og:image"), "https://x.com/a.jpg");
+    // No words to describe it with, so no empty description either.
+    assert!(!body.contains("description"), "{body}");
+}
+
+#[tokio::test]
+async fn the_fragment_is_the_tags_alone() {
+    let relay = StubRelay::start(vec![note(NOTE, "hello", json!([])), kind0(ALICE, "alice")]).await;
+    let app = router(&relay, None);
+    let (status, _, page) = get_on(&app, &format!("/e/{}", nevent(NOTE))).await;
+    let (f_status, cache, fragment) = get_on(&app, &format!("/meta/e/{}", nevent(NOTE))).await;
+
+    assert_eq!((status, f_status), (StatusCode::OK, StatusCode::OK));
+    assert_eq!(cache, "public, max-age=300");
+    assert!(
+        fragment.starts_with("<meta name=\"description\""),
+        "{fragment}"
+    );
+    for absent in [
+        "<!doctype",
+        "<html",
+        "<head",
+        "<title",
+        "charset",
+        "viewport",
+        "<body",
+    ] {
+        assert!(
+            !fragment.to_lowercase().contains(absent),
+            "{absent} in {fragment}"
+        );
+    }
+    // Every tag the page has, the fragment has: the page is the fragment, wrapped.
+    assert!(
+        page.contains(&fragment),
+        "page:\n{page}\nfragment:\n{fragment}"
+    );
+}
+
+#[tokio::test]
+async fn fragments_skip_and_refuse_like_their_pages() {
+    let relay = StubRelay::start(vec![]).await;
+    let app = router(&relay, None);
+    let (status, _, body) = get_on(&app, &format!("/meta/e/{}", nevent(NOTE))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.is_empty(), "{body}");
+    let (status, _, body) = get_on(&app, "/meta/e/garbage").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.is_empty(), "{body}");
+}
+
+#[tokio::test]
+async fn og_accepts_a_note_id_as_well_as_og_e() {
+    let relay = StubRelay::start(vec![note(NOTE, "hello", json!([])), kind0(ALICE, "alice")]).await;
+    let app = router(&relay, None);
+    let note1 = nip19::note_from_hex(NOTE).unwrap();
+    for id in [nevent(NOTE), note1] {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/og/{id}.png"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "{id}");
+        assert_eq!(res.headers()["content-type"], "image/png");
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+    }
 }
 
 #[tokio::test]
@@ -249,9 +349,9 @@ async fn a_failed_delete_check_caches_the_card_briefly() {
 }
 
 #[tokio::test]
-async fn media_only_and_bare_quotes_are_skipped() {
+async fn video_only_and_bare_quotes_are_skipped() {
     let quote = format!("nostr:{}", nevent(OTHER));
-    for content in ["https://x.com/a.jpg", quote.as_str()] {
+    for content in ["https://x.com/a.mp4", quote.as_str()] {
         let relay =
             StubRelay::start(vec![note(NOTE, content, json!([])), kind0(ALICE, "alice")]).await;
         assert_skipped_and_cached(relay, NOTE).await;

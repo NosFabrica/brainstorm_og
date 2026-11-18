@@ -106,6 +106,79 @@ async fn an_article_unfurls_by_naddr_with_title_summary_and_author() {
 }
 
 #[tokio::test]
+async fn an_article_with_a_cover_advertises_the_cover() {
+    let relay = StubRelay::start(vec![
+        article(
+            ID,
+            "text",
+            json!([
+                ["d", "p"],
+                ["title", "T"],
+                ["image", "https://x.test/cover.jpg"]
+            ]),
+        ),
+        kind0(ALICE, "alice"),
+    ])
+    .await;
+    let (status, body) = get_on(&router(&relay, None), &format!("/e/{}", naddr("p"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(meta(&body, "og:image"), "https://x.test/cover.jpg");
+    assert!(!body.contains("og:image:width"), "{body}");
+}
+
+#[tokio::test]
+async fn other_addressable_events_use_their_own_title_summary_and_image() {
+    // A live stream (NIP-53): not an article, but it names itself the same way.
+    let relay = StubRelay::start(vec![
+        event(
+            ID,
+            ALICE,
+            30311,
+            "",
+            json!([
+                ["d", "live"],
+                ["title", "Nostr Dev Call"],
+                ["summary", "Weekly, open to all."],
+                ["image", "https://x.test/live.png"]
+            ]),
+        ),
+        kind0(ALICE, "alice"),
+    ])
+    .await;
+    let id = Entity::Address {
+        kind: 30311,
+        pubkey: ALICE.into(),
+        d: "live".into(),
+    }
+    .canonical();
+    let (status, body) = get_on(&router(&relay, None), &format!("/e/{id}")).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(meta(&body, "og:title"), "Nostr Dev Call");
+    assert_eq!(meta(&body, "og:description"), "Weekly, open to all.");
+    assert_eq!(meta(&body, "og:image"), "https://x.test/live.png");
+    assert_eq!(meta(&body, "og:type"), "website");
+    assert!(!body.contains("article:"), "{body}");
+}
+
+#[tokio::test]
+async fn an_addressable_event_without_a_title_is_still_skipped() {
+    let relay = StubRelay::start(vec![
+        event(ID, ALICE, 30311, "", json!([["d", "live"]])),
+        kind0(ALICE, "alice"),
+    ])
+    .await;
+    let id = Entity::Address {
+        kind: 30311,
+        pubkey: ALICE.into(),
+        d: "live".into(),
+    }
+    .canonical();
+    let (status, _) = get_on(&router(&relay, None), &format!("/e/{id}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn an_article_without_a_title_is_skipped() {
     for tags in [json!([["d", "p"]]), json!([["d", "p"], ["title", "  "]])] {
         let relay = StubRelay::start(vec![article(ID, "text", tags), kind0(ALICE, "alice")]).await;

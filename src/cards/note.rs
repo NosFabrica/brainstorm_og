@@ -1,10 +1,13 @@
 //! Note card (kind 1): the note's own text, cut; author strip.
+//!
+//! A note's first image is what its page advertises as `og:image`; the card is
+//! the fallback for notes without one. A note that is only an image draws it.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hash;
 use std::sync::Arc;
 
-use super::{fit, Body, Built, DrawCx, Meta, Skip};
+use super::{fit, Body, Built, DrawCx, ImageRequest, Meta, Skip, Visual};
 use crate::event::Event;
 use crate::nip19::{self, Entity};
 use crate::render::{self, INK, MUTED};
@@ -16,15 +19,41 @@ const SIZES: [f32; 7] = [44.0, 42.0, 40.0, 38.0, 36.0, 34.0, 32.0];
 const LINE_HEIGHT: f32 = 1.3;
 const REPLY_SIZE: f32 = 28.0;
 
+/// Rounded corners of a drawn image, as on the article card.
+const IMAGE_RADIUS: f32 = 24.0;
+
 #[derive(Debug, Hash)]
 struct Note {
     replying_to: Option<String>,
+    /// Empty for a note that is only an image.
     text: String,
+    /// Drawn only when there is no text: then it is the whole note.
+    image: Option<String>,
+}
+
+impl Note {
+    fn image_top(&self) -> f32 {
+        render::CONTENT_TOP
+            + if self.replying_to.is_some() {
+                REPLY_SIZE * 2.0
+            } else {
+                0.0
+            }
+    }
 }
 
 impl Body for Note {
     fn fingerprint(&self, h: &mut DefaultHasher) {
         self.hash(h);
+    }
+
+    fn visual(&self) -> Option<Visual> {
+        let url = self.image.as_ref().filter(|_| self.text.is_empty())?;
+        Some(Visual::Image(ImageRequest {
+            url: url.clone(),
+            width: render::CONTENT_W as u32,
+            height: (render::CONTENT_BOTTOM - self.image_top()) as u32,
+        }))
     }
 
     fn draw(&self, cx: &DrawCx) -> String {
@@ -42,6 +71,21 @@ impl Body for Note {
             };
             cx.lines(&mut out, x, top, &line, 1.0, &format!(r#"fill="{MUTED}""#));
             top += REPLY_SIZE * 2.0;
+        }
+        if self.text.is_empty() {
+            if let Some(png) = cx.image {
+                let id = "note-img";
+                out.push_str(&render::embed_png(
+                    id,
+                    x,
+                    top,
+                    width,
+                    bottom - top,
+                    IMAGE_RADIUS,
+                    png,
+                ));
+            }
+            return out;
         }
         let f = fit::fit(
             &self.text,
@@ -78,10 +122,15 @@ pub async fn build(st: &AppState, ev: &Event) -> Result<Built, Skip> {
     let (author, names) = tokio::join!(super::author(st, &ev.pubkey), super::names(st, &wanted));
     let name_of = |pk: &str| names.get(pk).cloned();
 
+    let image = first_image(ev);
     let text = text(&ev.content, name_of)
         .map(|t| render::sanitize(&t))
-        .filter(|t| !t.is_empty())
-        .ok_or(Skip::Empty)?;
+        .filter(|t| !t.is_empty());
+    // A picture with no words is still a note worth a preview; nothing at all is not.
+    if text.is_none() && image.is_none() {
+        return Err(Skip::Empty);
+    }
+    let text = text.unwrap_or_default();
     let replying_to = parent.map(|r| match r {
         Reply::To(pk) => render::sanitize(&name_of(&pk).unwrap_or_else(|| short_npub(&pk))),
         Reply::ToNote => "a note".into(),
@@ -93,13 +142,50 @@ pub async fn build(st: &AppState, ev: &Event) -> Result<Built, Skip> {
             description: fit::clip_words(&text, 200),
             og_type: "article",
             extra: vec![],
+            image: image.clone(),
         },
         author: Some(author),
         body: Arc::new(Note {
             replying_to,
             text: fit::clip_words(&text, MAX_CHARS),
+            image,
         }),
     })
+}
+
+/// File extensions that name a picture. Matched on the URL's path, so a query string doesn't hide one.
+const IMAGE_EXTENSIONS: [&str; 7] = ["jpg", "jpeg", "png", "gif", "webp", "avif", "jfif"];
+
+/// The first image in the note's text: a URL whose path ends in a picture's
+/// extension, or one a NIP-92 `imeta` tag says is an image (`m image/…`).
+pub fn first_image(ev: &Event) -> Option<String> {
+    let imeta_image = |url: &str| {
+        ev.tags_named("imeta").any(|fields| {
+            let has = |key: &str, ok: &dyn Fn(&str) -> bool| {
+                fields
+                    .iter()
+                    .any(|f| f.strip_prefix(key).is_some_and(|v| ok(v.trim())))
+            };
+            has("url ", &|v| v == url)
+                && has("m ", &|v| v.to_ascii_lowercase().starts_with("image/"))
+        })
+    };
+    ev.content
+        .split_whitespace()
+        .filter_map(|chunk| {
+            // A URL at the end of a sentence or in brackets: the punctuation isn't part of it.
+            let url =
+                chunk.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '>', '"', '\'']);
+            super::web_url(url)
+        })
+        .find(|url| has_image_extension(url) || imeta_image(url))
+}
+
+fn has_image_extension(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let last = path.rsplit('/').next().unwrap_or("");
+    last.rsplit_once('.')
+        .is_some_and(|(_, ext)| IMAGE_EXTENSIONS.iter().any(|e| ext.eq_ignore_ascii_case(e)))
 }
 
 enum Token<'a> {
@@ -330,10 +416,12 @@ mod tests {
                     description: "unhashed".into(),
                     og_type: "article",
                     extra: vec![],
+                    image: None,
                 },
                 body: Arc::new(Note {
                     replying_to: replying.map(str::to_string),
                     text: text.into(),
+                    image: None,
                 }),
             },
             delete_unknown: false,
@@ -358,6 +446,84 @@ mod tests {
         let mut other_desc = card("hello", None, "alice", None);
         other_desc.built.meta.description = "changed".into();
         assert_eq!(base, other_desc.version("e1"));
+    }
+
+    fn with_content(content: &str, tags: &[&[&str]]) -> Event {
+        Event {
+            content: content.into(),
+            ..ev(tags)
+        }
+    }
+
+    #[test]
+    fn first_image_is_the_first_picture_url() {
+        let e = with_content(
+            "see https://x.com/page and https://cdn.x/a.PNG?w=1, then https://cdn.x/b.jpg",
+            &[],
+        );
+        assert_eq!(first_image(&e).as_deref(), Some("https://cdn.x/a.PNG?w=1"));
+    }
+
+    #[test]
+    fn first_image_drops_trailing_punctuation() {
+        let e = with_content("(look: https://cdn.x/a.webp).", &[]);
+        assert_eq!(first_image(&e).as_deref(), Some("https://cdn.x/a.webp"));
+    }
+
+    #[test]
+    fn first_image_takes_an_extensionless_url_imeta_calls_an_image() {
+        let e = with_content(
+            "https://blossom.x/abc https://blossom.x/def",
+            &[
+                &["imeta", "url https://blossom.x/abc", "m video/mp4"],
+                &[
+                    "imeta",
+                    "url https://blossom.x/def",
+                    "m image/jpeg",
+                    "dim 10x10",
+                ],
+            ],
+        );
+        assert_eq!(first_image(&e).as_deref(), Some("https://blossom.x/def"));
+    }
+
+    #[test]
+    fn video_and_pages_are_not_images() {
+        let e = with_content(
+            "https://x.com/v.mp4 https://x.com/a.png.html nostr:abc",
+            &[],
+        );
+        assert_eq!(first_image(&e), None);
+    }
+
+    #[test]
+    fn an_image_only_note_draws_its_image_and_nothing_else() {
+        let note = Note {
+            replying_to: None,
+            text: String::new(),
+            image: Some("https://cdn.x/a.png".into()),
+        };
+        let Some(Visual::Image(req)) = note.visual() else {
+            panic!("an image-only note must ask for its image");
+        };
+        assert_eq!(req.url, "https://cdn.x/a.png");
+        let svg = note.draw(&DrawCx {
+            family: "Figtree",
+            measure: &|t, px, _| t.chars().count() as f32 * px * 0.5,
+            image: Some(b"png"),
+        });
+        assert!(svg.contains("<image "), "got {svg}");
+        assert!(!svg.contains("<text "), "got {svg}");
+    }
+
+    #[test]
+    fn a_note_with_text_draws_text_not_its_image() {
+        let note = Note {
+            replying_to: None,
+            text: "gm".into(),
+            image: Some("https://cdn.x/a.png".into()),
+        };
+        assert!(note.visual().is_none());
     }
 
     #[test]

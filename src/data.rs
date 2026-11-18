@@ -161,17 +161,36 @@ pub async fn get_card(state: &AppState, pointer: &Pointer) -> Card {
         .card_cache
         .get_with(hex.clone(), async move {
             let deadline = Duration::from_secs(st.config.request_deadline_secs);
-            // Whole-request budget: partial data beats a crawler timeout.
-            let fetched = tokio::time::timeout(deadline, async {
-                tokio::join!(fetch_overview(&st, &hex), fetch_meta(&st, &hex))
-            })
-            .await;
-
-            let (overview, meta) = match fetched {
-                Ok(pair) => pair,
-                Err(_) => {
-                    tracing::warn!("card assembly for {hex} hit the {deadline:?} deadline");
-                    (None, None)
+            let started = tokio::time::Instant::now();
+            // Both start at once; the counts are waited for only if they'll be used.
+            let mut counts = tokio::spawn({
+                let (st, hex) = (st.clone(), hex.clone());
+                async move { fetch_overview(&st, &hex).await }
+            });
+            // Whole-request budget: partial data beats a crawler timeout. And a
+            // person's page load waits on this too (the UI includes these tags
+            // in every share page), so nothing is waited for that won't be shown.
+            let meta = tokio::time::timeout(deadline, fetch_meta(&st, &hex))
+                .await
+                .unwrap_or_else(|_| {
+                    tracing::warn!("kind-0 for {hex} hit the {deadline:?} deadline");
+                    None
+                });
+            // The counts only stand in for a missing bio (`meta_description`).
+            // Production's /overview has taken 30 s and more, so waiting on it
+            // regardless held every profile to the full deadline.
+            let overview = if meta.as_ref().is_some_and(|m| m.about.is_some()) {
+                counts.abort();
+                None
+            } else {
+                let left = deadline.saturating_sub(started.elapsed());
+                match tokio::time::timeout(left, &mut counts).await {
+                    Ok(Ok(overview)) => overview,
+                    _ => {
+                        counts.abort();
+                        tracing::warn!("overview for {hex} missed the {deadline:?} deadline");
+                        None
+                    }
                 }
             };
 
