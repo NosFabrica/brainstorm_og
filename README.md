@@ -28,16 +28,22 @@ it degrades unfurls back to the generic card rather than breaking anything.
   item under `PLACE_CONCEPT`), or **any other addressable event** (30000–39999)
   with a `title` tag — a live stream, a video, a listing — described by its own
   `title`, `summary` and `image` like an article, but `og:type` `website` and no
-  `article:` properties; other kinds are 404. A note's title is
+  `article:` properties, and never quoting its content (a NIP-51 set keeps
+  ciphertext there, app data JSON); other kinds are 404. A note's title is
   "<author> on Brainstorm" and its description its text, cut, with `nostr:`
   mentions as names. `og:image` is the event's own picture when it has one — a
   note's first image (by extension, or an `imeta` tag with `m image/…`), an
-  article's or event's `image` tag — and the generated card otherwise; only the
-  card states `og:image:width`/`height`/`type`. A note that is only an image is
-  not skipped: it unfurls as that image, with no description. Read from the search relay
-  by id or coordinate, one retry after `ENTITY_RETRY_DELAY_MS` on a miss.
-  Skipped (404) when not found (`max-age=60`, not cached), NSFW, deleted by its
-  author, or empty after stripping (no text and no image). A failed delete check still draws the card
+  article's or event's `image` tag — and the generated card otherwise. The own
+  picture is advertised through the UI's imgproxy (`IMG_PROXY_PATH`), resized
+  to 1280 wide and as JPEG (`og:image:type` `image/jpeg`): originals can be
+  megabytes, AVIF/WebP or `http://`. Only the card states `og:image:width`/
+  `height`. A note that is only an image is not skipped: it unfurls as that
+  image, with no description. Read from the search relay by id or coordinate,
+  one retry after `ENTITY_RETRY_DELAY_MS` on a miss. Skipped (404) when not
+  found (`max-age=60`, remembered for `NOT_FOUND_TTL_SECS`), NSFW, deleted by
+  its author, or empty after stripping (no text and no image). Loads run in
+  their own task, so one whose caller gave up (nginx's include stops waiting at
+  5 s) still finishes and is cached. A failed delete check still draws the card
   but caches it like a provisional one. `canonical` is the hint-free `/e/` link.
 - `GET /s/{code}` → the card for a **short share link**, resolved via the API
   and cached. `profile` codes render the `/p/` card (canonical `/p/`), `event`
@@ -115,13 +121,15 @@ with a different audience and is free to look different.
   that is what made the original design slow. The REQ carries
   `"search": "include:spam"`: the relay refuses a read naming no lens, and this
   one is plain recall. `nprofile` relay hints are parsed but never dialled.
-- **Relationship counts**: one cached call to
+- **Relationship counts**: one call to
   `GET {API_BASE_URL}/user/{hex}/overview`, used solely for the follower and
-  following numbers in the meta description of a profile with no `about`.
-  Started alongside the kind-0 but waited for only when the kind-0 has no
-  `about` (production's has taken 30–70 s; staging's ~3 s). Past the deadline
-  the card keeps the kind-0 it already has. The score it also returns is
-  ignored.
+  following numbers in the meta description of a profile page with no
+  `about` — asked for only then, after the kind-0, and never for a card's
+  author strip. Cached apart from the card (a failure for
+  `PROVISIONAL_TTL_SECS`). Waited for only within what is left of the
+  deadline (production's has taken 30–70 s; staging's ~3 s); a late answer
+  finishes in the background and is kept for the next request. The score it
+  also returns is ignored.
 
 Everything is cached in a bounded in-memory LRU (no disk).
 
@@ -191,7 +199,9 @@ container; the caches are in-memory, so restarting is what resets them.
 | `CACHE_MAX_ENTRIES` | `500` | card LRU size |
 | `CACHE_MAX_BYTES` | `67108864` (64 MB) | rendered-PNG LRU cap |
 | `CACHE_TTL_SECS` | `600` | origin re-render interval |
-| `PROVISIONAL_TTL_SECS` | `60` | TTL when no kind-0 was found |
+| `PROVISIONAL_TTL_SECS` | `60` | TTL when no kind-0 was found, and for failed counts |
+| `NOT_FOUND_TTL_SECS` | `15` | how long an entity the relay lacks is remembered as missing; `0` never |
+| `IMG_PROXY_PATH` | `/img` | the UI's imgproxy under `APP_BASE_URL`, for an entity's own picture; set empty to advertise originals |
 | `HTML_CACHE_MAX_AGE` | `300` | meta HTML `Cache-Control` |
 | `IMAGE_CACHE_MAX_AGE` | `31536000` | card `Cache-Control`, immutable |
 | `FETCH_TIMEOUT_SECS` | `4` | per upstream call; covers a ~3.7 s cold relay read |

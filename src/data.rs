@@ -130,6 +130,27 @@ impl Card {
     }
 }
 
+/// Counts found are kept like a card; a failed fetch only briefly.
+pub struct OverviewExpiry {
+    pub missing: Duration,
+    pub normal: Duration,
+}
+
+impl moka::Expiry<String, Option<Overview>> for OverviewExpiry {
+    fn expire_after_create(
+        &self,
+        _key: &String,
+        value: &Option<Overview>,
+        _now: std::time::Instant,
+    ) -> Option<Duration> {
+        Some(if value.is_some() {
+            self.normal
+        } else {
+            self.missing
+        })
+    }
+}
+
 /// Per-entry TTL so provisional cards die young.
 pub struct CardExpiry {
     pub provisional: Duration,
@@ -151,57 +172,93 @@ impl moka::Expiry<String, Card> for CardExpiry {
     }
 }
 
-/// Assemble (and cache) a profile card. `get_with` coalesces concurrent loads
-/// of the same key, so a crawler burst on one profile does one fetch.
+/// Assemble (and cache) a profile card: the kind-0 only, which is everything
+/// the card draws. `get_with` coalesces concurrent loads of the same key, so a
+/// crawler burst on one profile does one fetch.
+///
+/// The load runs in its own task. A caller that stops waiting (nginx's include
+/// timing out, a client gone) would otherwise cancel it half-done, and the next
+/// visitor would start from nothing; spawned, it finishes and lands in the cache.
 pub async fn get_card(state: &AppState, pointer: &Pointer) -> Card {
     let hex = pointer.hex.clone();
     let st = state.clone();
+    let key = hex.clone();
+    tokio::spawn(async move {
+        let load = assemble(st.clone(), key.clone());
+        st.card_cache.get_with(key, load).await
+    })
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!("card load for {hex} failed: {e}");
+        Card {
+            hex,
+            meta: ProfileMeta::default(),
+            overview: None,
+            provisional: true,
+        }
+    })
+}
 
-    state
-        .card_cache
-        .get_with(hex.clone(), async move {
-            let deadline = Duration::from_secs(st.config.request_deadline_secs);
-            let started = tokio::time::Instant::now();
-            // Both start at once; the counts are waited for only if they'll be used.
-            let mut counts = tokio::spawn({
-                let (st, hex) = (st.clone(), hex.clone());
-                async move { fetch_overview(&st, &hex).await }
-            });
-            // Whole-request budget: partial data beats a crawler timeout. And a
-            // person's page load waits on this too (the UI includes these tags
-            // in every share page), so nothing is waited for that won't be shown.
-            let meta = tokio::time::timeout(deadline, fetch_meta(&st, &hex))
-                .await
-                .unwrap_or_else(|_| {
-                    tracing::warn!("kind-0 for {hex} hit the {deadline:?} deadline");
-                    None
-                });
-            // The counts only stand in for a missing bio (`meta_description`).
-            // Production's /overview has taken 30 s and more, so waiting on it
-            // regardless held every profile to the full deadline.
-            let overview = if meta.as_ref().is_some_and(|m| m.about.is_some()) {
-                counts.abort();
-                None
-            } else {
-                let left = deadline.saturating_sub(started.elapsed());
-                match tokio::time::timeout(left, &mut counts).await {
-                    Ok(Ok(overview)) => overview,
-                    _ => {
-                        counts.abort();
-                        tracing::warn!("overview for {hex} missed the {deadline:?} deadline");
-                        None
-                    }
-                }
-            };
-
-            Card {
-                hex,
-                provisional: meta.is_none(),
-                meta: meta.unwrap_or_default(),
-                overview,
-            }
-        })
+async fn assemble(st: AppState, hex: String) -> Card {
+    let deadline = Duration::from_secs(st.config.request_deadline_secs);
+    // Whole-request budget: partial data beats a crawler timeout.
+    let meta = tokio::time::timeout(deadline, fetch_meta(&st, &hex))
         .await
+        .unwrap_or_else(|_| {
+            tracing::warn!("kind-0 for {hex} hit the {deadline:?} deadline");
+            None
+        });
+    Card {
+        hex,
+        provisional: meta.is_none(),
+        meta: meta.unwrap_or_default(),
+        overview: None,
+    }
+}
+
+/// A profile page's card: [`get_card`] plus the follower counts, which stand in
+/// for a missing bio in the description (`meta_description`) and nowhere else.
+/// So they are asked for only then, never for an author strip, and waited for
+/// only within what is left of the deadline: production's `/overview` has
+/// taken 30 s and more.
+pub async fn get_profile(state: &AppState, pointer: &Pointer) -> Card {
+    let started = tokio::time::Instant::now();
+    let mut card = get_card(state, pointer).await;
+    if card.meta.about.is_none() {
+        let deadline = Duration::from_secs(state.config.request_deadline_secs);
+        let left = deadline.saturating_sub(started.elapsed());
+        card.overview = get_overview(state, &card.hex, left).await;
+    }
+    card
+}
+
+/// The counts, cached on their own (a miss briefly, as a provisional card is).
+/// Fetched in a task that outlives `wait`: a slow answer is kept for the next
+/// request rather than thrown away, and the fetch is still bounded by its own
+/// timeout.
+async fn get_overview(state: &AppState, hex: &str, wait: Duration) -> Option<Overview> {
+    let st = state.clone();
+    let key = hex.to_string();
+    let load = tokio::spawn(async move {
+        let fetch = {
+            let (st, key) = (st.clone(), key.clone());
+            async move { fetch_overview(&st, &key).await }
+        };
+        st.overview_cache.get_with(key, fetch).await
+    });
+    match tokio::time::timeout(wait, load).await {
+        Ok(Ok(overview)) => overview,
+        Ok(Err(e)) => {
+            tracing::warn!("overview load for {hex} failed: {e}");
+            None
+        }
+        Err(_) => {
+            tracing::debug!(
+                "overview for {hex} not back within {wait:?}; it finishes in the background"
+            );
+            None
+        }
+    }
 }
 
 async fn fetch_overview(state: &AppState, hex: &str) -> Option<Overview> {

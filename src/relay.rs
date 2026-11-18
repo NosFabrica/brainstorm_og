@@ -36,25 +36,39 @@ pub async fn fetch_kind0(
 
 /// Every event the relay returns for `filter` up to EOSE. `include:spam` is
 /// added here so no read can forget the lens.
-pub async fn fetch_events(
+pub async fn fetch_events(relay_url: &str, filter: Value, timeout_secs: u64) -> Result<Vec<Value>> {
+    fetch_events_matching(relay_url, vec![filter], timeout_secs).await
+}
+
+/// Every event matching any of `filters`, in one REQ on one connection, up to
+/// EOSE. Each filter gets the `include:spam` lens.
+pub async fn fetch_events_matching(
     relay_url: &str,
-    mut filter: Value,
+    mut filters: Vec<Value>,
     timeout_secs: u64,
 ) -> Result<Vec<Value>> {
-    filter["search"] = json!("include:spam");
+    for f in &mut filters {
+        f["search"] = json!("include:spam");
+    }
     timeout(
         Duration::from_secs(timeout_secs),
-        fetch_inner(relay_url, filter),
+        fetch_inner(relay_url, filters),
     )
     .await
     .map_err(|_| anyhow!("relay {relay_url} timed out"))?
 }
 
-async fn fetch_inner(relay_url: &str, filter: Value) -> Result<Vec<Value>> {
+async fn fetch_inner(relay_url: &str, filters: Vec<Value>) -> Result<Vec<Value>> {
     let (mut ws, _) = tokio_tungstenite::connect_async(relay_url).await?;
-    let limit = filter.get("limit").and_then(Value::as_u64);
-    let req = json!(["REQ", "og", filter]);
-    ws.send(Message::Text(req.to_string().into())).await?;
+    // A `limit` ends the read early only when it is the whole question.
+    let limit = match filters.as_slice() {
+        [only] => only.get("limit").and_then(Value::as_u64),
+        _ => None,
+    };
+    let mut req = vec![json!("REQ"), json!("og")];
+    req.extend(filters);
+    ws.send(Message::Text(Value::Array(req).to_string().into()))
+        .await?;
 
     let mut events = Vec::new();
     while let Some(msg) = ws.next().await {

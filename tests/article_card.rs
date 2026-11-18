@@ -122,7 +122,10 @@ async fn an_article_with_a_cover_advertises_the_cover() {
     .await;
     let (status, body) = get_on(&router(&relay, None), &format!("/e/{}", naddr("p"))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(meta(&body, "og:image"), "https://x.test/cover.jpg");
+    assert_eq!(
+        meta(&body, "og:image"),
+        format!("{APP}/img/insecure/media_1280/plain/https%3A%2F%2Fx.test%2Fcover.jpg@jpg")
+    );
     assert!(!body.contains("og:image:width"), "{body}");
 }
 
@@ -156,9 +159,39 @@ async fn other_addressable_events_use_their_own_title_summary_and_image() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(meta(&body, "og:title"), "Nostr Dev Call");
     assert_eq!(meta(&body, "og:description"), "Weekly, open to all.");
-    assert_eq!(meta(&body, "og:image"), "https://x.test/live.png");
+    assert!(
+        meta(&body, "og:image").ends_with("https%3A%2F%2Fx.test%2Flive.png@jpg"),
+        "{body}"
+    );
     assert_eq!(meta(&body, "og:type"), "website");
     assert!(!body.contains("article:"), "{body}");
+}
+
+#[tokio::test]
+async fn other_addressable_events_never_quote_their_content() {
+    // A NIP-51 set: its content is the encrypted private half of the list.
+    let relay = StubRelay::start(vec![
+        event(
+            ID,
+            ALICE,
+            30000,
+            "c2VjcmV0IGZyaWVuZHM=?iv=AAAAAAAAAAAAAAAAAAAAAA==",
+            json!([["d", "friends"], ["title", "Friends"]]),
+        ),
+        kind0(ALICE, "alice"),
+    ])
+    .await;
+    let id = Entity::Address {
+        kind: 30000,
+        pubkey: ALICE.into(),
+        d: "friends".into(),
+    }
+    .canonical();
+    let (status, body) = get_on(&router(&relay, None), &format!("/e/{id}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(meta(&body, "og:title"), "Friends");
+    assert!(!body.contains("iv="), "content leaked: {body}");
+    assert!(!body.contains("description"), "{body}");
 }
 
 #[tokio::test]

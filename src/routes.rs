@@ -25,6 +25,7 @@ pub async fn healthz(State(st): State<AppState>) -> Response {
         // fact rather than an estimate.
         "caches": {
             "card": cache_stats(&st.card_cache),
+            "overview": cache_stats(&st.overview_cache),
             "entity": cache_stats(&st.entity_cache),
             "short_code": cache_stats(&st.short_code_cache),
             "png": cache_stats(&st.png_cache),
@@ -62,8 +63,8 @@ pub enum Form {
     /// A whole HTML document: `/p/`, `/e/`, `/s/` asked of this service directly.
     Page,
     /// Only the tags, for the UI's nginx to include in the SPA's own `<head>`:
-    /// `/meta/p/`, `/meta/e/`, `/meta/s/`. Every visitor gets them, so no one
-    /// has to guess which User-Agents are link previewers.
+    /// `/meta/p/`, `/meta/e/`, `/meta/s/` (routed in `lib.rs`). Every visitor
+    /// gets them, so no one has to guess which User-Agents are link previewers.
     Fragment,
 }
 
@@ -72,12 +73,11 @@ pub async fn profile(st: State<AppState>, id: Path<String>) -> Response {
     profile_as(st, id, Form::Page).await
 }
 
-/// `/meta/p/{id}` — [`profile`]'s tags alone.
-pub async fn profile_fragment(st: State<AppState>, id: Path<String>) -> Response {
-    profile_as(st, id, Form::Fragment).await
-}
-
-async fn profile_as(State(st): State<AppState>, Path(id): Path<String>, form: Form) -> Response {
+pub async fn profile_as(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    form: Form,
+) -> Response {
     let pointer = match nip19::decode(&id) {
         Ok(p) => p,
         Err(e) => {
@@ -86,7 +86,7 @@ async fn profile_as(State(st): State<AppState>, Path(id): Path<String>, form: Fo
         }
     };
 
-    let card = data::get_card(&st, &pointer).await;
+    let card = data::get_profile(&st, &pointer).await;
     meta_response(&st, &id, &card, form)
 }
 
@@ -98,12 +98,7 @@ pub async fn short_link(st: State<AppState>, code: Path<String>) -> Response {
     short_link_as(st, code, Form::Page).await
 }
 
-/// `/meta/s/{code}` — [`short_link`]'s tags alone.
-pub async fn short_link_fragment(st: State<AppState>, code: Path<String>) -> Response {
-    short_link_as(st, code, Form::Fragment).await
-}
-
-async fn short_link_as(
+pub async fn short_link_as(
     State(st): State<AppState>,
     Path(code): Path<String>,
     form: Form,
@@ -111,7 +106,7 @@ async fn short_link_as(
     match data::resolve_short_code(&st, &code).await {
         Some(ShortTarget::Profile(hex)) => {
             let pointer = Pointer { hex };
-            let card = data::get_card(&st, &pointer).await;
+            let card = data::get_profile(&st, &pointer).await;
             // Canonical is the hint-free npub, so short-link and npub shares consolidate.
             let id = nip19::npub_from_hex(&pointer.hex).unwrap_or_else(|| pointer.hex.clone());
             meta_response(&st, &id, &card, form)
@@ -126,12 +121,7 @@ pub async fn entity(st: State<AppState>, id: Path<String>) -> Response {
     entity_as(st, id, Form::Page).await
 }
 
-/// `/meta/e/{id}` — [`entity`]'s tags alone.
-pub async fn entity_fragment(st: State<AppState>, id: Path<String>) -> Response {
-    entity_as(st, id, Form::Fragment).await
-}
-
-async fn entity_as(State(st): State<AppState>, Path(id): Path<String>, form: Form) -> Response {
+pub async fn entity_as(State(st): State<AppState>, Path(id): Path<String>, form: Form) -> Response {
     match nip19::decode_entity(&id) {
         Ok(entity) => entity_page(&st, &entity, form).await,
         Err(e) => {
@@ -316,7 +306,7 @@ fn entity_meta_response(st: &AppState, card: &EntityCard, form: Form) -> Respons
     let id = card.entity.canonical();
     let meta = &card.built.meta;
     let image = match &meta.image {
-        Some(url) => PageImage::Own(url.clone()),
+        Some(url) => own_image(st, url),
         None => PageImage::Card(format!(
             "{app}/og/e/{id}.png?v={}",
             card.version(&st.config.render_epoch)
@@ -351,16 +341,51 @@ struct Page {
 enum PageImage {
     /// Our 1200×630 PNG, so its type and size can be stated.
     Card(String),
-    /// The entity's own picture, on someone else's server: size and type unknown.
-    Own(String),
+    /// The entity's own picture through our image proxy: a JPEG, size unknown.
+    Proxied(String),
+    /// The entity's own picture where its author put it: nothing known.
+    Original(String),
 }
 
 impl PageImage {
     fn url(&self) -> &str {
         match self {
-            PageImage::Card(u) | PageImage::Own(u) => u,
+            PageImage::Card(u) | PageImage::Proxied(u) | PageImage::Original(u) => u,
         }
     }
+}
+
+/// An entity's own picture, as previewers should fetch it: through the UI's
+/// imgproxy (`IMG_PROXY_PATH`), resized to 1280 wide and re-encoded as JPEG.
+///
+/// The original can be megabytes (WhatsApp shows no image past ~600 KB), AVIF
+/// or WebP (not every previewer decodes them), or plain `http://`; the proxied
+/// copy is none of those, on our https origin. Same URL shape as the UI's
+/// `proxiedSrc` (lib/imageProxy.ts), with `@jpg` asking for the format. When
+/// the proxy is down, nginx redirects a non-browser fetch to the original.
+fn own_image(st: &AppState, url: &str) -> PageImage {
+    let proxy = &st.config.img_proxy_path;
+    if proxy.is_empty() {
+        return PageImage::Original(url.to_string());
+    }
+    PageImage::Proxied(format!(
+        "{}{proxy}/insecure/media_1280/plain/{}@jpg",
+        st.config.app_base_url,
+        encode_uri_component(url)
+    ))
+}
+
+/// JavaScript's `encodeURIComponent`: everything but `A-Z a-z 0-9 - _ . ! ~ * ' ( )`.
+fn encode_uri_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 fn html_response(st: &AppState, page: &Page, form: Form) -> Response {
@@ -421,7 +446,8 @@ fn head_tags(page: &Page) -> String {
             "<meta property=\"og:image:width\" content=\"1200\"/>\n",
             "<meta property=\"og:image:height\" content=\"630\"/>\n",
         ),
-        PageImage::Own(_) => "",
+        PageImage::Proxied(_) => "<meta property=\"og:image:type\" content=\"image/jpeg\"/>\n",
+        PageImage::Original(_) => "",
     };
 
     format!(
@@ -522,6 +548,17 @@ mod tests {
             }),
             provisional: false,
         }
+    }
+
+    #[test]
+    fn encode_uri_component_matches_javascript() {
+        // encodeURIComponent("https://x.com/a b.png?w=1&h=2#f") in a browser.
+        assert_eq!(
+            encode_uri_component("https://x.com/a b.png?w=1&h=2#f"),
+            "https%3A%2F%2Fx.com%2Fa%20b.png%3Fw%3D1%26h%3D2%23f"
+        );
+        assert_eq!(encode_uri_component("-_.!~*'()"), "-_.!~*'()");
+        assert_eq!(encode_uri_component("é@"), "%C3%A9%40");
     }
 
     #[test]

@@ -22,7 +22,7 @@ const REPLY_SIZE: f32 = 28.0;
 /// Rounded corners of a drawn image, as on the article card.
 const IMAGE_RADIUS: f32 = 24.0;
 
-#[derive(Debug, Hash)]
+#[derive(Debug)]
 struct Note {
     replying_to: Option<String>,
     /// Empty for a note that is only an image.
@@ -43,8 +43,13 @@ impl Note {
 }
 
 impl Body for Note {
+    /// The image only when it is drawn, i.e. when there is no text.
     fn fingerprint(&self, h: &mut DefaultHasher) {
-        self.hash(h);
+        self.replying_to.hash(h);
+        self.text.hash(h);
+        if self.text.is_empty() {
+            self.image.hash(h);
+        }
     }
 
     fn visual(&self) -> Option<Visual> {
@@ -514,6 +519,27 @@ mod tests {
         });
         assert!(svg.contains("<image "), "got {svg}");
         assert!(!svg.contains("<text "), "got {svg}");
+    }
+
+    #[test]
+    fn an_undrawn_image_stays_out_of_the_version() {
+        let with = |text: &str, image: &str| {
+            let mut c = card(text, None, "alice", None);
+            c.built.body = Arc::new(Note {
+                replying_to: None,
+                text: text.into(),
+                image: Some(image.into()),
+            });
+            c.version("e1")
+        };
+        // Text drawn, image not: changing the image is no new card.
+        assert_eq!(with("gm", "https://x/a.png"), with("gm", "https://x/b.png"));
+        assert_eq!(
+            with("gm", "https://x/a.png"),
+            card("gm", None, "alice", None).version("e1")
+        );
+        // Image-only: the image is the card.
+        assert_ne!(with("", "https://x/a.png"), with("", "https://x/b.png"));
     }
 
     #[test]

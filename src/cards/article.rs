@@ -129,13 +129,20 @@ pub async fn build(st: &AppState, ev: &Event) -> Result<Built, Skip> {
     let image = ev.tag("image").and_then(super::web_url);
     let author = super::author(st, &ev.pubkey).await;
 
-    let description = summary
-        .clone()
-        .or_else(|| note::text(&ev.content, |_| None).map(|t| render::sanitize(&t)))
-        .map(|d| fit::clip_words(&d, 200))
-        .unwrap_or_default();
     // Only an article claims `article:` properties; anything else is a website.
     let long_form = ev.kind == LONG_FORM;
+    // Only an article's content is prose to quote. Other addressable kinds keep
+    // NIP-04/44 ciphertext (a NIP-51 set's private items) or JSON there.
+    let description = summary
+        .clone()
+        .or_else(|| {
+            long_form
+                .then(|| note::text(&ev.content, |_| None))
+                .flatten()
+                .map(|t| render::sanitize(&t))
+        })
+        .map(|d| fit::clip_words(&d, 200))
+        .unwrap_or_default();
     let mut extra = vec![];
     if long_form {
         if let Some(npub) = nip19::npub_from_hex(&ev.pubkey) {

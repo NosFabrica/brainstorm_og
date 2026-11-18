@@ -23,6 +23,9 @@ pub fn config() -> Config {
         html_cache_max_age: 300,
         image_cache_max_age: 31_536_000,
         provisional_ttl_secs: 5,
+        // Never remembered: suites that are about remembering it opt in.
+        not_found_ttl_secs: 0,
+        img_proxy_path: "/img".into(),
         fetch_timeout_secs: 1,
         entity_retry_delay_ms: 10,
         avatar_timeout_secs: 1,

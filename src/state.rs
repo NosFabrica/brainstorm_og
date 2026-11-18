@@ -31,7 +31,10 @@ pub struct AppState {
     /// Bundled faces, for measuring text before layout.
     pub metrics: Arc<crate::render::Metrics>,
     pub card_cache: Cache<String, Card>,
-    /// Entity key -> card or settled skip. Not-found is never cached.
+    /// Pubkey -> follower counts, `None` when the fetch failed. Apart from the
+    /// card because only a profile page without a bio uses them.
+    pub overview_cache: Cache<String, Option<crate::data::Overview>>,
+    /// Entity key -> card or skip. Not-found only for `not_found_ttl_secs`.
     pub entity_cache: Cache<String, crate::cards::Outcome>,
     /// Short code -> what it names. Immutable once minted, so no TTL.
     pub short_code_cache: Cache<String, crate::data::ShortTarget>,
@@ -121,10 +124,18 @@ impl AppState {
                 normal: ttl,
             })
             .build();
+        let overview_cache = Cache::builder()
+            .max_capacity(config.card_cache_capacity)
+            .expire_after(crate::data::OverviewExpiry {
+                missing: Duration::from_secs(config.provisional_ttl_secs),
+                normal: ttl,
+            })
+            .build();
         let entity_cache = Cache::builder()
             .max_capacity(config.card_cache_capacity)
             .expire_after(crate::cards::OutcomeExpiry {
                 provisional: Duration::from_secs(config.provisional_ttl_secs),
+                not_found: Duration::from_secs(config.not_found_ttl_secs),
                 normal: ttl,
             })
             .build();
@@ -163,6 +174,7 @@ impl AppState {
             fontdb: Arc::new(db),
             metrics: Arc::new(metrics),
             card_cache,
+            overview_cache,
             entity_cache,
             short_code_cache,
             png_cache,

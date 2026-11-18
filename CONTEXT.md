@@ -82,9 +82,14 @@ inferred from list order.
 
 A note that carries a photo, an article with a cover: the preview shows that
 picture, as the app does, rather than our drawing of the text. Our card is for
-events that have none. Its URL is the author's, so we state no size or type for
-it, and it is not fetched or checked here — it is a link in a tag, and the
-previewer decides what to do with it, as it would for the author's own site.
+events that have none.
+
+It is advertised through the UI's imgproxy, the one the app already draws
+pictures with, not as the author's URL: an original can be megabytes (WhatsApp
+drops an `og:image` past ~600 KB), AVIF or WebP (not every previewer decodes
+them), or `http://`. The proxied copy is a JPEG at most 1280 wide on our https
+origin. We still don't fetch it here; if the proxy is down, nginx redirects a
+previewer to the original.
 
 ### Image URLs are content-addressed, plus a render epoch
 
@@ -137,9 +142,13 @@ time. With the tags in every page there is no list to keep.
 
 What it costs: a person's page load now waits on the include. Bounded at 5 s in
 nginx (over the 4 s profile deadline, so our partial answer wins the race), a
-cached card in about a millisecond, and a cold profile no longer waits for the
-counts it won't show. The fragment carries no `<title>`: that names a person's
-tab, and the app's share screens restore the title they found on unmount.
+cached card in about a millisecond. So nothing is waited for that won't be
+shown: counts only for a profile page without a bio, never for an author
+strip; a missing note is remembered for a few seconds rather than re-read on
+every view; and a load nginx stopped waiting for finishes in its own task and
+is cached for the next visitor instead of being cancelled. The fragment
+carries no `<title>`: that names a person's tab, and the app's share screens
+restore the title they found on unmount.
 
 Why SSI and not this service serving the page: the SPA's `index.html` belongs to
 the UI image and changes with every deploy; nginx already has it. Whatever the
