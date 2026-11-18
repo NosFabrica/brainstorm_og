@@ -4,7 +4,7 @@ use std::env;
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bind_addr: String,
-    /// brainstorm-server base (overview stats). No trailing slash.
+    /// brainstorm-server base (ORE-02 follower counts). No trailing slash.
     pub api_base_url: String,
     /// This environment's canonical origin, no trailing slash. Every absolute
     /// URL we emit comes from here; the request `Host` is never read. CONTEXT.md.

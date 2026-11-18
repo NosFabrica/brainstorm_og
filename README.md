@@ -121,15 +121,17 @@ with a different audience and is free to look different.
   that is what made the original design slow. The REQ carries
   `"search": "include:spam"`: the relay refuses a read naming no lens, and this
   one is plain recall. `nprofile` relay hints are parsed but never dialled.
-- **Relationship counts**: one call to
-  `GET {API_BASE_URL}/user/{hex}/overview`, used solely for the follower and
-  following numbers in the meta description of a profile page with no
-  `about` — asked for only then, after the kind-0, and never for a card's
-  author strip. Cached apart from the card (a failure for
+- **Relationship counts**: one call to ORE-02
+  `POST {API_BASE_URL}/stats/pubkey` (`{"pubkey": hex}`, the House view), used
+  solely for the follower and following numbers in the meta description of a
+  profile page with no `about` — asked for only then, after the kind-0, and
+  never for a card's author strip. Cached apart from the card (a failure for
   `PROVISIONAL_TTL_SECS`). Waited for only within what is left of the
-  deadline (production's has taken 30–70 s; staging's ~3 s); a late answer
-  finishes in the background and is kept for the next request. The score it
-  also returns is ignored.
+  deadline; a late answer finishes in the background and is kept for the next
+  request. The rank it also returns is ignored. Not `/user/{hex}/overview`,
+  which counts the profile's flagged neighbours live on every call: on
+  2026-11-18 it took 22–25 s on production for a 121k-follower account, where
+  ORE-02 took 0.5 s for the same counts.
 
 Everything is cached in a bounded in-memory LRU (no disk).
 
@@ -168,10 +170,10 @@ dominated by network round-trips, not by anything this service computes.
 | Rasterisation alone (no avatar to fetch) | ~99 ms | ~1 ms |
 
 Reading that: of a ~2 s cold meta request, roughly 100 ms is ours. The rest is
-the kind-0 lookup and the overview call, which run concurrently, so the cost is
-the slower of the two — and the overview is waited for only when the profile
-has no `about` (2026-11-18, production overview at 30–70 s: a cold profile with
-a bio in ~0.3 s, where every cold profile had taken the full 4 s deadline). The card is cheaper than the meta HTML only because the
+the kind-0 lookup and, for a profile with no `about` only, the counts after it.
+(2026-11-18: a cold profile with a bio ~0.3 s, one without ~0.6 s with ORE-02's
+counts, where every cold profile had taken the full 4 s deadline waiting on
+`/user/{hex}/overview`.) The card is cheaper than the meta HTML only because the
 meta request has already populated the card cache; a card fetched first pays the
 same upstream cost. Avatar fetching adds ~0.4 s against an arbitrary remote host
 and is the single largest component of a cold card once metadata is cached.
@@ -193,7 +195,7 @@ container; the caches are in-memory, so restarting is what resets them.
 | Var | Default | Notes |
 |---|---|---|
 | `BIND_ADDR` | `0.0.0.0:8080` | |
-| `API_BASE_URL` | `http://brainstorm-server:8000` | overview stats |
+| `API_BASE_URL` | `http://brainstorm-server:8000` | follower counts (ORE-02 `/stats/pubkey`) |
 | `APP_BASE_URL` | `https://brainstorm.world` | **every** absolute URL we emit |
 | `LOCAL_RELAY_URL` | `wss://search.brainstorm.world` | the only relay queried; must accept NIP-50 `search` (strfry rejects it) |
 | `CACHE_MAX_ENTRIES` | `500` | card LRU size |

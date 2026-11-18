@@ -1,5 +1,5 @@
 //! `/p/{id}`'s timing: a person's page load waits on these tags (the UI includes
-//! them in every share page), so a slow `/overview` must cost only what it adds.
+//! them in every share page), so slow follower counts must cost only what they add.
 
 mod common;
 
@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use axum::{routing::get, Json, Router};
+use axum::{routing::post, Json, Router};
 use brainstorm_og::config::Config;
 use brainstorm_og::nip19;
 use common::relay::{event, StubRelay};
@@ -19,22 +19,33 @@ use tower::ServiceExt;
 
 const ALICE: &str = "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d";
 
-/// An API whose `/overview` answers after `delay`, counting the calls.
+/// brainstorm-server's ORE-02 `POST /stats/pubkey`, answering after `delay`
+/// and counting the calls. Only answers for the pubkey it was asked about, so
+/// a wrong request body shows up as missing counts.
 async fn api(delay: Duration) -> (String, Arc<AtomicUsize>) {
     let calls = Arc::new(AtomicUsize::new(0));
     let seen = calls.clone();
     let app = Router::new().route(
-        "/user/{hex}/overview",
-        get(move || {
+        "/stats/pubkey",
+        post(move |Json(req): Json<serde_json::Value>| {
             let seen = seen.clone();
             async move {
                 seen.fetch_add(1, Ordering::SeqCst);
                 tokio::time::sleep(delay).await;
-                Json(json!({ "data": {
-                    "influence": 0.5,
-                    "counts": { "followed_by": 12, "following": 34 },
-                    "tier": "high"
-                }}))
+                if req["pubkey"] != ALICE {
+                    return Err(axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+                }
+                Ok(Json(json!({
+                    "pubkey": ALICE,
+                    "rank": 0.5,
+                    "follows": 34,
+                    "followers": 12,
+                    "mutes": 0,
+                    "muters": 1,
+                    "reports": 0,
+                    "reporters": 2,
+                    "ttl": 3600
+                })))
             }
         }),
     );

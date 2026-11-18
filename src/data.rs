@@ -52,31 +52,20 @@ impl ProfileMeta {
     }
 }
 
-/// Trust stats from brainstorm-server.
+/// A profile's rank and follower counts, from brainstorm-server's ORE-02.
 #[derive(Clone, Default, Debug)]
 pub struct Overview {
     pub influence: Option<f64>,
     pub followers: i64,
     pub following: i64,
-    /// The server's tier bucket, taken as truth. Bands are never re-derived here.
-    pub tier: Option<String>,
 }
 
+/// `POST /stats/pubkey` (ORE-02), the fields we read.
 #[derive(Deserialize)]
-struct OverviewEnvelope {
-    data: OverviewData,
-}
-#[derive(Deserialize)]
-struct OverviewData {
-    influence: Option<f64>,
-    #[serde(default)]
-    tier: Option<String>,
-    counts: OverviewCounts,
-}
-#[derive(Deserialize)]
-struct OverviewCounts {
-    followed_by: i64,
-    following: i64,
+struct StatsPubkey {
+    rank: Option<f64>,
+    followers: Option<i64>,
+    follows: Option<i64>,
 }
 
 /// Everything needed to render a card / meta tags for one pubkey.
@@ -219,8 +208,8 @@ async fn assemble(st: AppState, hex: String) -> Card {
 /// A profile page's card: [`get_card`] plus the follower counts, which stand in
 /// for a missing bio in the description (`meta_description`) and nowhere else.
 /// So they are asked for only then, never for an author strip, and waited for
-/// only within what is left of the deadline: production's `/overview` has
-/// taken 30 s and more.
+/// only within what is left of the deadline: production's `/user/{hex}/overview`
+/// took 30 s and more, which is why the counts now come from ORE-02.
 pub async fn get_profile(state: &AppState, pointer: &Pointer) -> Card {
     let started = tokio::time::Instant::now();
     let mut card = get_card(state, pointer).await;
@@ -261,33 +250,38 @@ async fn get_overview(state: &AppState, hex: &str, wait: Duration) -> Option<Ove
     }
 }
 
+/// The counts from ORE-02 `POST /stats/pubkey`, under the House view (no
+/// `pov`, no signer). Not `/user/{hex}/overview`: that one also counts the
+/// profile's flagged neighbours live, walking every edge it has, and on
+/// production took 22–25 s for a 121k-follower account where this took 0.5 s.
+/// We show the counts and nothing else.
 async fn fetch_overview(state: &AppState, hex: &str) -> Option<Overview> {
-    let url = format!("{}/user/{}/overview", state.config.api_base_url, hex);
+    let url = format!("{}/stats/pubkey", state.config.api_base_url);
     let resp = state
         .http
-        .get(&url)
+        .post(&url)
+        .json(&serde_json::json!({ "pubkey": hex }))
         .timeout(Duration::from_secs(state.config.fetch_timeout_secs))
         .send()
         .await
-        .map_err(|e| tracing::warn!("overview request failed for {hex}: {e}"))
+        .map_err(|e| tracing::warn!("stats request failed for {hex}: {e}"))
         .ok()?;
 
     if !resp.status().is_success() {
-        tracing::warn!("overview {hex} -> HTTP {}", resp.status());
+        tracing::warn!("stats {hex} -> HTTP {}", resp.status());
         return None;
     }
 
-    let env: OverviewEnvelope = resp
+    let stats: StatsPubkey = resp
         .json()
         .await
-        .map_err(|e| tracing::warn!("overview decode failed for {hex}: {e}"))
+        .map_err(|e| tracing::warn!("stats decode failed for {hex}: {e}"))
         .ok()?;
 
     Some(Overview {
-        influence: env.data.influence,
-        followers: env.data.counts.followed_by,
-        following: env.data.counts.following,
-        tier: env.data.tier,
+        influence: stats.rank,
+        followers: stats.followers.unwrap_or(0),
+        following: stats.follows.unwrap_or(0),
     })
 }
 
@@ -428,7 +422,6 @@ mod tests {
                 influence,
                 followers: 0,
                 following: 0,
-                tier: None,
             }),
             provisional: false,
         }

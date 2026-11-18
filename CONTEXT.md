@@ -51,8 +51,12 @@ This also removed the `flagged` question entirely. Previously the card clamped
 to the unverified floor so a reported account never rendered red; now there is
 nothing to clamp.
 
-`/overview` is still called, but only for the follower and following counts in
-the meta description. The `tier` bucket it returns is ignored.
+The server is still asked for the follower and following counts, for the meta
+description of a profile without a bio, and nothing else. They come from ORE-02
+`POST /stats/pubkey`, not `/user/{hex}/overview`: the latter also works out the
+viewer-facing flagged fields, walking every edge the profile has on every call,
+which on production took 22–25 s for a large account against ORE-02's 0.5 s.
+The rank ORE-02 returns is ignored.
 
 ### Metadata comes from the search relay
 

@@ -13,7 +13,7 @@ use crate::data::Card;
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
-    /// Trusted destinations (the overview API). Follows redirects.
+    /// Trusted destinations (brainstorm-server's ORE-02). Follows redirects.
     pub http: reqwest::Client,
     /// Attacker-controlled avatar URLs. No redirects: one would bypass the
     /// pre-connect address check.

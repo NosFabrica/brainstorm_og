@@ -544,7 +544,6 @@ mod tests {
                 influence,
                 followers: 12,
                 following: 34,
-                tier: Some("high".into()),
             }),
             provisional: false,
         }
