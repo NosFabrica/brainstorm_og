@@ -39,7 +39,7 @@ pub struct AppState {
     /// Short code -> what it names. Immutable once minted, so no TTL.
     pub short_code_cache: Cache<String, crate::data::ShortTarget>,
     pub png_cache: Cache<String, Bytes>,
-    /// Fixed-window rate-limit counters for `/link-preview`, keyed by tier and
+    /// Fixed-window rate-limit counters for `/link-preview`, keyed by caller and
     /// client IP. Entries expire with the window.
     pub preview_rate: Cache<String, Arc<AtomicU64>>,
     /// Parsed previews, keyed by normalised URL.

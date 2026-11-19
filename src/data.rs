@@ -52,10 +52,9 @@ impl ProfileMeta {
     }
 }
 
-/// A profile's rank and follower counts, from brainstorm-server's ORE-02.
+/// A profile's follower counts, from brainstorm-server's ORE-02.
 #[derive(Clone, Default, Debug)]
 pub struct Overview {
-    pub influence: Option<f64>,
     pub followers: i64,
     pub following: i64,
 }
@@ -63,7 +62,6 @@ pub struct Overview {
 /// `POST /stats/pubkey` (ORE-02), the fields we read.
 #[derive(Deserialize)]
 struct StatsPubkey {
-    rank: Option<f64>,
     followers: Option<i64>,
     follows: Option<i64>,
 }
@@ -92,8 +90,8 @@ impl Card {
     /// Content fingerprint for the `?v=` on `og:image` — what makes a changed
     /// name or avatar reach a crawler.
     ///
-    /// Covers exactly what the card renders and nothing else. Score and
-    /// relationship counts are excluded: they move constantly, and hashing
+    /// Covers exactly what the card renders and nothing else. Relationship
+    /// counts are excluded: they move constantly, and hashing
     /// them would mint a new image URL for an image identical to the last one.
     /// `about` is out for the same reason — it only feeds the meta
     /// description, which is served with a short max-age anyway.
@@ -106,16 +104,6 @@ impl Card {
         // otherwise never reach anything holding an immutable URL.
         render_epoch.hash(&mut h);
         format!("{:x}", h.finish())
-    }
-
-    /// `Rank`: the published 0-100 integer, `round(influence * 100)`.
-    pub fn rank(&self) -> Option<i64> {
-        let v = self.overview.as_ref()?.influence?;
-        if !v.is_finite() {
-            return None;
-        }
-        let scaled = if v <= 1.0 { v * 100.0 } else { v };
-        Some(scaled.round().clamp(0.0, 100.0) as i64)
     }
 }
 
@@ -279,7 +267,6 @@ async fn fetch_overview(state: &AppState, hex: &str) -> Option<Overview> {
         .ok()?;
 
     Some(Overview {
-        influence: stats.rank,
         followers: stats.followers.unwrap_or(0),
         following: stats.follows.unwrap_or(0),
     })
@@ -411,7 +398,7 @@ mod tests {
 
     const EPOCH: &str = "test-epoch";
 
-    fn card(name: Option<&str>, influence: Option<f64>) -> Card {
+    fn card(name: Option<&str>) -> Card {
         Card {
             hex: "a".repeat(64),
             meta: ProfileMeta {
@@ -419,7 +406,6 @@ mod tests {
                 ..Default::default()
             },
             overview: Some(Overview {
-                influence,
                 followers: 0,
                 following: 0,
             }),
@@ -459,7 +445,7 @@ mod tests {
 
     #[test]
     fn falls_back_to_truncated_npub() {
-        let c = card(None, None);
+        let c = card(None);
         let shown = c.display_name();
         // Never blank, and recognisably an npub rather than raw hex.
         assert!(shown.starts_with("npub1"), "got {shown}");
@@ -467,44 +453,24 @@ mod tests {
     }
 
     #[test]
-    fn rank_scales_and_clamps() {
-        assert_eq!(card(Some("a"), Some(0.42)).rank(), Some(42));
-        assert_eq!(card(Some("a"), Some(1.0)).rank(), Some(100));
-        assert_eq!(card(Some("a"), Some(0.0)).rank(), Some(0));
-        // Already-scaled values pass through.
-        assert_eq!(card(Some("a"), Some(42.0)).rank(), Some(42));
-        // Non-finite must not reach `as i64`.
-        assert_eq!(card(Some("a"), Some(f64::NAN)).rank(), None);
-        assert_eq!(card(Some("a"), Some(f64::INFINITY)).rank(), None);
-        assert_eq!(card(Some("a"), None).rank(), None);
-    }
-
-    #[test]
     fn version_tracks_rendered_content() {
-        let a = card(Some("Alice"), Some(0.42));
-        assert_eq!(
-            a.version(EPOCH),
-            card(Some("Alice"), Some(0.42)).version(EPOCH)
-        );
+        let a = card(Some("Alice"));
+        assert_eq!(a.version(EPOCH), card(Some("Alice")).version(EPOCH));
 
         // A changed name must mint a new image URL — it is drawn.
-        assert_ne!(
-            a.version(EPOCH),
-            card(Some("Alice B"), Some(0.42)).version(EPOCH)
-        );
+        assert_ne!(a.version(EPOCH), card(Some("Alice B")).version(EPOCH));
 
-        // A changed score must NOT: the card no longer draws one, so a new URL
-        // would only force a re-fetch of a byte-identical image. Scores move
-        // constantly, so this is the difference between a stable URL and one
-        // that churns on every GrapeRank run.
-        assert_eq!(
-            a.version(EPOCH),
-            card(Some("Alice"), Some(0.55)).version(EPOCH)
-        );
-        assert_eq!(a.version(EPOCH), card(Some("Alice"), None).version(EPOCH));
+        // Changed counts must NOT: they aren't drawn and move constantly, so a
+        // new URL would only force a re-fetch of a byte-identical image.
+        let mut moved = card(Some("Alice"));
+        moved.overview = Some(Overview {
+            followers: 99,
+            following: 7,
+        });
+        assert_eq!(a.version(EPOCH), moved.version(EPOCH));
 
         // `about` only feeds the short-lived meta description.
-        let mut b = card(Some("Alice"), Some(0.42));
+        let mut b = card(Some("Alice"));
         b.meta.about = Some("changed".into());
         assert_eq!(a.version(EPOCH), b.version(EPOCH));
 
@@ -513,10 +479,10 @@ mod tests {
         assert_ne!(a.version(EPOCH), a.version("other-epoch"));
 
         // ...but the avatar and nip05 are drawn.
-        let mut c = card(Some("Alice"), Some(0.42));
+        let mut c = card(Some("Alice"));
         c.meta.picture = Some("https://example/new.png".into());
         assert_ne!(a.version(EPOCH), c.version(EPOCH));
-        let mut d = card(Some("Alice"), Some(0.42));
+        let mut d = card(Some("Alice"));
         d.meta.nip05 = Some("alice@example.com".into());
         assert_ne!(a.version(EPOCH), d.version(EPOCH));
     }
