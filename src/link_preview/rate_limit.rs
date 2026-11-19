@@ -44,8 +44,8 @@ const LIMITED_CACHE: &str = "no-store";
 const MAX_BUCKETS: u64 = 100_000;
 
 /// Which ceiling a request is measured against. Named after the config it
-/// reads (`LINK_PREVIEW_RATE_TRUSTED` / `_UNTRUSTED`). Not "tier": that already
-/// names the GrapeRank score bucket `data::Overview` carries in this crate.
+/// reads (`LINK_PREVIEW_RATE_TRUSTED` / `_UNTRUSTED`). Not "tier": that names
+/// GrapeRank's score buckets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Caller {
     /// Our own SPA, by `Sec-Fetch-Site` or a `Referer` under `APP_BASE_URL`.
